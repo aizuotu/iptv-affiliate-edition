@@ -4,7 +4,17 @@
 原项目是 GPL-3.0 许可的 Node.js 单体 IPTV 管理服务；本版本**没有改动任何播放源、提取器或代理逻辑**，只增加了一层可配置、可关闭、中英双语的推广位，以及一个不需要后台密码的公开落地页。
 
 > 上游仓库：[github.com/akiralereal/iptv](https://github.com/akiralereal/iptv) · 授权：GPL-3.0（见 `LICENSE`）
-> 配套实测文章：[圈一下 · IPTV 后台二开实录](https://www.quanyixia.com/iptv-affiliate-links-diy/)
+> 配套实测文章：[中文 · IPTV 后台二开实录](https://www.quanyixia.com/iptv-affiliate-links-diy/) · [English · IPTV Affiliate Edition](https://www.quanyixia.com/en/iptv-affiliate-fork-download-en/)
+
+## 下载 / Downloads
+
+| 入口 | 说明 |
+| --- | --- |
+| [本仓库](https://github.com/aizuotu/iptv-affiliate-edition) | 完整源码，可直接 clone / Star / 提 issue |
+| [源码 zip（国内可达镜像）](https://gh-proxy.com/https://github.com/aizuotu/iptv-affiliate-edition/archive/refs/heads/main.zip) | 本机实测 `github.com` 直连返回 000，走这个镜像可以下载完整包 |
+| [补丁包 iptv-affiliate-patch.zip](https://www.quanyixia.com/downloads/iptv-affiliate-patch.zip) | 仅 8 个改动文件 + `changes.diff`，约 240 KB，适合已有上游源码时套用 |
+
+补丁包 sha256：`a70dd32b11a16a591c05e17ed3d4b3c44bd4bdade0a69107b6764e907d53aeb9`。
 
 ## 改了什么 / What changed
 
