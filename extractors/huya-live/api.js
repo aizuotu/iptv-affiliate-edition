@@ -1,0 +1,639 @@
+/** 虎牙直播：分类页解析、房间信息读取与 HLS 播放签名。 */
+import { createHash } from 'node:crypto'
+import fetch from 'node-fetch'
+import { printYellow } from '../../utils/colorOut.js'
+import { qualityFrom } from '../../utils/qualityOverride.js'
+import { isWatchTogetherFilm } from '../watchTogether.js'
+
+export const HUYA_GROUP = '虎牙'
+export const REFERER = 'https://www.huya.com/'
+export const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
+  + '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+export const DEFAULT_MIN_HEAT = 3000
+export const DEFAULT_QUALITY = 2000
+// 后台下拉框与播放地址 ?quality= 共用这一份档位表
+export const QUALITY_OPTIONS = Object.freeze([
+  { value: 0, label: '原画 / 最高画质' },
+  { value: 20000, label: '4K' },
+  { value: 14000, label: '2K' },
+  { value: 4000, label: '蓝光 4M' },
+  { value: 2000, label: '超清 2M（推荐）' },
+  { value: 500, label: '流畅 500K' },
+])
+
+export const AREA_PAGES = Object.freeze({
+  赛事: 'https://www.huya.com/m',
+  网游: 'https://www.huya.com/g/100023',
+  手游: 'https://www.huya.com/g/100004',
+  单机: 'https://www.huya.com/g/100002',
+  娱乐: 'https://www.huya.com/g/100022',
+  一起看: 'https://www.huya.com/g/2135',
+})
+
+const RESOLVE_TTL_MS = 60 * 1000          // 房间页与签名地址复用时长
+const LINE_REJECT_MS = 5 * 60 * 1000      // 被 CDN 拒绝的线路冷却时长
+const ROOM_RETRY_MS = 10 * 1000           // 所有线路都被拒后，多久再去试一轮；连续失败逐次翻倍
+const ROOM_RETRY_MAX_MS = 2 * 60 * 1000
+const MANIFEST_TIMEOUT_MS = 8000
+// 房间页给的 wsTime 是签名到期时刻（约取页后 5 分钟）。复用的签名到期前后被拒才重签；
+// 没到期就被拒是线路在拒这个出口（AL 线路有过「新签名首取放行、再取就拒」），重签只会越签越被拒，直接换线
+const SESSION_EXPIRY_MARGIN_MS = 30 * 1000
+const roomCache = new Map()      // room:quality -> { expiresAt, name, presenterUid, bitrate, lines }
+const roomPending = new Map()
+const lineSessions = new Map()   // room:quality -> Map<cdn, { url, streamName, base, bitrate, signedAt, expiresAt }>：播放期间一直复用的签名地址
+const rejectedLines = new Map()  // room -> Map<cdn, until>
+const preferredLine = new Map()  // room -> 上次能播的线路
+const roomFailUntil = new Map()  // room -> { until, desc, streak }
+
+export class HuyaError extends Error {
+  constructor(message) {
+    super(message)
+    this.name = 'HuyaError'
+  }
+}
+
+/**
+ * 房间号不存在或已注销（多半是填错了）。和「未开播」一样只记提示、跳过不列，
+ * 不算这一轮真出错：否则填错一个、其余主播又都没开播时整轮判失败，正确房间的「未开播」也出不来。
+ */
+export class HuyaRoomMissingError extends HuyaError {
+  constructor(message) {
+    super(message)
+    this.name = 'HuyaRoomMissingError'
+  }
+}
+
+export class HuyaOfflineError extends HuyaError {
+  /** room：未开播房间的主播名和头像，手动房间靠它照样列出频道。 */
+  constructor(message, room = null) {
+    super(message)
+    this.name = 'HuyaOfflineError'
+    this.room = room
+  }
+}
+
+function md5(text) {
+  return createHash('md5').update(String(text)).digest('hex')
+}
+
+function decodeHtml(text) {
+  return String(text || '')
+    .replace(/<!--.*?-->/gs, '')
+    .replace(/<[^>]*>/g, '')
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCodePoint(parseInt(n, 16)))
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function normalizeImage(raw) {
+  const value = decodeHtml(raw).trim()
+  if (value.startsWith('//')) return `https:${value}`
+  return value.replace(/^http:\/\//i, 'https://')
+}
+
+function attributeOf(tag, name) {
+  const match = new RegExp(`\\b${name}\\s*=\\s*(["'])(.*?)\\1`, 'i').exec(tag)
+  return match ? decodeHtml(match[2]) : ''
+}
+
+function openingTagWithClass(html, tagName, className) {
+  const re = new RegExp(`<${tagName}\\b[^>]*>`, 'gi')
+  for (const match of html.matchAll(re)) {
+    const classes = attributeOf(match[0], 'class').split(/\s+/)
+    if (classes.includes(className)) return match[0]
+  }
+  return ''
+}
+
+/** 从 JS 赋值中取出完整 JSON；字符串里的括号不会提前结束扫描。 */
+export function extractAssignedJson(source, marker, fromIndex = 0) {
+  const markerIndex = source.indexOf(marker, fromIndex)
+  if (markerIndex < 0) throw new HuyaError(`页面缺少 ${marker}`)
+  const start = source.slice(markerIndex + marker.length).search(/[\[{]/)
+  if (start < 0) throw new HuyaError(`${marker} 后没有 JSON`)
+  const absoluteStart = markerIndex + marker.length + start
+  const stack = []
+  let quote = ''
+  let escaped = false
+  for (let i = absoluteStart; i < source.length; i++) {
+    const ch = source[i]
+    if (quote) {
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (ch === quote) quote = ''
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      continue
+    }
+    if (ch === '[' || ch === '{') stack.push(ch)
+    if (ch === ']' || ch === '}') {
+      const expected = ch === ']' ? '[' : '{'
+      if (stack.pop() !== expected) throw new HuyaError(`${marker} JSON 括号不匹配`)
+    }
+    if (stack.length === 0) {
+      try {
+        return JSON.parse(source.slice(absoluteStart, i + 1))
+      } catch (error) {
+        throw new HuyaError(`${marker} JSON 解析失败：${error.message}`)
+      }
+    }
+  }
+  throw new HuyaError(`${marker} JSON 不完整`)
+}
+
+export function normalizeRoom(raw) {
+  let value = String(raw || '').normalize('NFKC').trim()
+  if (!value) throw new HuyaError('虎牙房间号为空')
+  if (/^https?:\/\//i.test(value)) {
+    let url
+    try { url = new URL(value) } catch { throw new HuyaError(`不是有效的虎牙直播间地址：${value}`) }
+    const host = url.hostname.toLowerCase()
+    if (host !== 'huya.com' && !host.endsWith('.huya.com')) {
+      throw new HuyaError(`不是虎牙直播间地址：${value}`)
+    }
+    value = url.pathname.split('/').filter(Boolean)[0] || ''
+  }
+  if (!/^[a-z0-9_-]{1,64}$/i.test(value) || /^(?:g|m)$/i.test(value)) {
+    throw new HuyaError(`虎牙房间号格式不正确：${value || raw}`)
+  }
+  return value
+}
+
+export function parseRoomList(text) {
+  const seen = new Set()
+  const rooms = []
+  for (const line of String(text || '').split('\n')) {
+    const value = line.trim()
+    if (!value || value.startsWith('#')) continue
+    const room = normalizeRoom(value)
+    if (!seen.has(room)) {
+      seen.add(room)
+      rooms.push(room)
+    }
+  }
+  return rooms
+}
+
+export function parseHeat(raw) {
+  const text = decodeHtml(raw).replace(/,/g, '')
+  const match = /([\d.]+)\s*(亿|万)?/.exec(text)
+  if (!match) return 0
+  const multiplier = match[2] === '亿' ? 100000000 : match[2] === '万' ? 10000 : 1
+  return Math.round(Number(match[1]) * multiplier) || 0
+}
+
+/** 赛事页没有 ALL_LIST_DATA，直播卡片是服务端渲染的，直接从卡片读取。 */
+export function parseEventRooms(html) {
+  const rooms = []
+  const seen = new Set()
+  const re = /<li\b[^>]*class=(["'])[^"']*\bmatch-live-item\b[^"']*\1[^>]*>([\s\S]*?)<\/li>/gi
+  for (const match of html.matchAll(re)) {
+    const body = match[2]
+    const videoTag = openingTagWithClass(body, 'a', 'video-info')
+    const titleTag = openingTagWithClass(body, 'a', 'title')
+    const imageTag = openingTagWithClass(body, 'img', 'pic')
+    const roomMatch = /^https?:\/\/(?:www\.)?huya\.com\/([a-z0-9_-]{1,64})(?:[/?#]|$)/i.exec(attributeOf(videoTag, 'href'))
+    if (!roomMatch || seen.has(roomMatch[1])) continue
+    const heatMatch = /<i\b[^>]*class=(["'])[^"']*\bjs-num\b[^"']*\1[^>]*>([\s\S]*?)<\/i>/i.exec(body)
+    const nickTag = openingTagWithClass(body, 'i', 'nick')
+    seen.add(roomMatch[1])
+    rooms.push({
+      roomId: roomMatch[1],
+      name: attributeOf(titleTag, 'title') || attributeOf(imageTag, 'alt') || `虎牙 ${roomMatch[1]}`,
+      nick: attributeOf(nickTag, 'title'),
+      logo: normalizeImage(attributeOf(imageTag, 'data-original') || attributeOf(imageTag, 'src')),
+      heat: parseHeat(heatMatch?.[2]),
+    })
+  }
+  return rooms
+}
+
+/** 网游/手游/单机/娱乐页把当前直播间放在 ALL_LIST_DATA。 */
+export function parseCategoryRooms(html) {
+  const rows = extractAssignedJson(html, 'var ALL_LIST_DATA')
+  if (!Array.isArray(rows)) throw new HuyaError('虎牙分类页直播列表结构异常')
+  const seen = new Set()
+  const rooms = []
+  for (const row of rows) {
+    const rawRoom = row?.lProfileRoom || row?.sPrivateHost || row?.lUid
+    let roomId
+    try { roomId = normalizeRoom(rawRoom) } catch { continue }
+    if (seen.has(roomId)) continue
+    seen.add(roomId)
+    rooms.push({
+      roomId,
+      name: decodeHtml(row?.sIntroduction || row?.sRoomName || row?.sNick) || `虎牙 ${roomId}`,
+      nick: decodeHtml(row?.sNick),
+      logo: normalizeImage(row?.sScreenshot || row?.sAvatar180),
+      heat: Number(row?.lTotalCount || row?.lUserCount || row?.lActivityCount || 0) || 0,
+      game: decodeHtml(row?.sGameFullName),
+    })
+  }
+  return rooms
+}
+
+function selectTopRooms(rooms, limit, minHeat) {
+  return [...rooms]
+    .filter(room => Number(room.heat || 0) >= Number(minHeat || 0))
+    .sort((a, b) => Number(b.heat || 0) - Number(a.heat || 0))
+    .slice(0, Math.max(0, Number(limit) || 0))
+}
+
+async function fetchText(url, { timeoutMs = 10000, fetchImpl = fetch } = {}) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await fetchImpl(url, {
+      headers: { 'User-Agent': UA, Referer: REFERER, Accept: 'text/html,application/xhtml+xml' },
+      redirect: 'follow',
+      signal: controller.signal,
+    })
+    if (!response.ok) throw new HuyaError(`HTTP ${response.status}`)
+    return await response.text()
+  } catch (error) {
+    if (error instanceof HuyaError) throw error
+    const reason = error?.name === 'AbortError' ? `超时 ${timeoutMs}ms` : (error?.message || String(error))
+    throw new HuyaError(reason)
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+export async function topRoomsOfArea(areaName, limit, options = {}) {
+  const url = AREA_PAGES[areaName]
+  if (!url) throw new HuyaError(`未知分类「${areaName}」`)
+  const html = await fetchText(url, options)
+  const rooms = areaName === '赛事' ? parseEventRooms(html) : parseCategoryRooms(html)
+  const candidates = areaName === '一起看' ? rooms.filter(room => isWatchTogetherFilm('huya', room, room.game)) : rooms
+  return selectTopRooms(candidates, limit, options.minHeat)
+}
+
+/**
+ * 未开播时播放器配置里没有流，主播昵称和头像只在 TT_PROFILE_INFO。房间号不存在的页面
+ * 同样没有流，但这份资料是空的（profileRoom 为 0）——要和「未开播」分开，免得填错的房间号被列出来。
+ */
+function offlineRoom(html, requestedRoom) {
+  let profile
+  try { profile = extractAssignedJson(html, 'var TT_PROFILE_INFO') } catch {
+    // 页面改版找不到这份资料：退回只报未开播、不列出
+    return new HuyaOfflineError(`虎牙房间 ${requestedRoom || ''} 当前未开播`.trim())
+  }
+  const nick = decodeHtml(profile?.nick).trim()
+  const profileRoom = String(profile?.profileRoom || '')
+  if (!nick || !/^[1-9]\d*$/.test(profileRoom)) {
+    return new HuyaRoomMissingError(`虎牙房间 ${requestedRoom || ''} 不存在或已注销`.trim())
+  }
+  return new HuyaOfflineError(`虎牙房间 ${requestedRoom || ''} 当前未开播`.trim(), {
+    roomId: normalizeRoom(profileRoom),
+    nick,
+    logo: normalizeImage(profile.avatar),
+    offline: true,
+  })
+}
+
+/** 只截取 hyPlayerConfig.stream；外层是 JS 对象，不是严格 JSON。 */
+export function parseRoomPage(html, requestedRoom = '') {
+  const configAt = html.indexOf('var hyPlayerConfig')
+  if (configAt < 0) throw new HuyaError('虎牙房间页缺少播放器配置')
+  const streamMarker = /\bstream\s*:/.exec(html.slice(configAt))
+  if (!streamMarker) throw new HuyaError('虎牙房间页缺少直播流配置')
+  const markerAt = configAt + streamMarker.index
+  const stream = extractAssignedJson(html, streamMarker[0], markerAt)
+  const rows = Array.isArray(stream?.data) ? stream.data : []
+  const row = rows.find(item => Array.isArray(item?.gameStreamInfoList) && item.gameStreamInfoList.length)
+  if (!row) throw offlineRoom(html, requestedRoom)
+  const info = row.gameLiveInfo || {}
+  const roomId = normalizeRoom(info.profileRoom || requestedRoom || info.uid)
+  return {
+    roomId,
+    name: decodeHtml(info.introduction || info.roomName || info.nick) || `虎牙 ${roomId}`,
+    nick: decodeHtml(info.nick),
+    logo: normalizeImage(info.screenshot || info.avatar180),
+    heat: Number(info.totalCount || info.activityCount || 0) || 0,
+    presenterUid: String(info.uid || ''),
+    streams: row.gameStreamInfoList,
+    bitrates: Array.isArray(stream?.vMultiStreamInfo) ? stream.vMultiStreamInfo : [],
+  }
+}
+
+export async function fetchRoom(roomRef, options = {}) {
+  const room = normalizeRoom(roomRef)
+  const html = await fetchText(`https://www.huya.com/${encodeURIComponent(room)}`, options)
+  return parseRoomPage(html, room)
+}
+
+// 赛事房间在原画之上还挂着 2K（14000）、4K（20000）转码档，不登录也能取，原画本身
+// 多为 1080P。HDR 档（iCompatibleFlag 非 0，如 14100、4200）HLS 取不到，一律跳过。
+const HIGH_RES_MIN = 10000
+
+function bitrateLabel(rate) {
+  if (rate >= 20000) return '4K'
+  if (rate >= HIGH_RES_MIN) return '2K'
+  return rate ? `${rate}K` : '原画'
+}
+
+export function selectBitrate(rows, requested = 2000) {
+  const wanted = Math.max(0, Number(requested) || 0)
+  const rates = [...new Set((Array.isArray(rows) ? rows : [])
+    .filter(row => !Number(row?.iCompatibleFlag))
+    .map(row => Number(row?.iBitRate))
+    .filter(rate => Number.isFinite(rate) && rate > 0))]
+    .sort((a, b) => b - a)
+  // 0 = 最高画质：有 2K/4K 就取最高的那档，没有就是原画（不带 ratio）
+  if (wanted === 0) return rates[0] >= HIGH_RES_MIN ? rates[0] : 0
+  // 要 2K/4K 但房间没有：退回原画，别掉到比原画还低的 8M/4M
+  if (wanted >= HIGH_RES_MIN) return rates.find(rate => rate >= HIGH_RES_MIN && rate <= wanted) || 0
+  if (!rates.length) return wanted
+  return rates.find(rate => rate <= wanted) || rates[rates.length - 1]
+}
+
+/**
+ * 官网 H5 播放器当前的匿名 Web 签名。
+ * fm 解码后是一个带 $0..$3 占位符的模板；$2 是 seqid/ctype/platform 的 MD5。
+ */
+export function signHlsUrl(streamInfo, presenterUid, bitrate = 2000, now = Date.now()) {
+  const streamName = String(streamInfo?.sStreamName || '').trim()
+  const base = String(streamInfo?.sHlsUrl || '').trim()
+  const suffix = String(streamInfo?.sHlsUrlSuffix || 'm3u8').replace(/^\./, '')
+  const antiCode = String(streamInfo?.sHlsAntiCode || '')
+  if (!streamName || !/^https?:\/\//i.test(base) || !antiCode) {
+    throw new HuyaError('虎牙房间没有可用的 HLS 流')
+  }
+  const baseUrl = new URL(base)
+  if (baseUrl.hostname !== 'huya.com' && !baseUrl.hostname.endsWith('.huya.com')) {
+    throw new HuyaError('虎牙 HLS 地址不属于官方域名')
+  }
+
+  const old = new URLSearchParams(antiCode)
+  const wsTime = old.get('wsTime') || ''
+  const ctype = old.get('ctype') || 'huya_webh5'
+  const fm = old.get('fm') || ''
+  if (!/^[0-9a-f]+$/i.test(wsTime) || !fm) throw new HuyaError('虎牙 HLS 签名参数不完整')
+
+  let template
+  try { template = Buffer.from(fm.replace(/ /g, '+'), 'base64').toString('utf8') } catch { /* below */ }
+  if (!template) throw new HuyaError('虎牙 HLS 签名模板解码失败')
+
+  const seqid = String(Math.trunc(Number(now)))
+  const platform = '100'
+  const secret = md5(template
+    .replaceAll('$0', String(presenterUid || '0'))
+    .replaceAll('$1', streamName)
+    .replaceAll('$2', md5(`${seqid}|${ctype}|${platform}`))
+    .replaceAll('$3', wsTime))
+
+  const params = new URLSearchParams()
+  params.set('wsSecret', secret)
+  params.set('wsTime', wsTime)
+  params.set('seqid', seqid)
+  params.set('ctype', ctype)
+  params.set('ver', '1')
+  const replaced = new Set(['wsSecret', 'wsTime', 'fm', 'seqid', 'ctype', 'ver', 'ratio', 'u', 't'])
+  for (const [key, value] of old) if (!replaced.has(key)) params.append(key, value)
+  if (Number(bitrate) > 0) params.set('ratio', String(Math.trunc(Number(bitrate))))
+  params.set('u', String(presenterUid || '0'))
+  params.set('t', platform)
+
+  const url = new URL(`${base.replace(/\/$/, '')}/${streamName}.${suffix}`)
+  if (url.protocol === 'http:') url.protocol = 'https:'
+  url.search = params.toString()
+  return url.href
+}
+
+async function fetchManifest(url, { timeoutMs = MANIFEST_TIMEOUT_MS, fetchImpl = fetch } = {}) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await fetchImpl(url, {
+      headers: { 'User-Agent': UA, Referer: REFERER, Accept: 'application/vnd.apple.mpegurl,*/*' },
+      redirect: 'follow',
+      signal: controller.signal,
+    })
+    const text = await response.text()
+    return { status: response.status, text, finalUrl: response.url || url }
+  } catch (error) {
+    const reason = error?.name === 'AbortError' ? `超时 ${timeoutMs}ms` : (error?.message || String(error))
+    throw new HuyaError(reason)
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** 只看分片的响应状态，正文不读完：TX 线路有过「清单 200、分片 403」。 */
+async function probeSegment(url, { timeoutMs = MANIFEST_TIMEOUT_MS, fetchImpl = fetch } = {}) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await fetchImpl(url, {
+      headers: { 'User-Agent': UA, Referer: REFERER },
+      redirect: 'follow',
+      signal: controller.signal,
+    })
+    const status = response.status
+    try { await (response.body?.cancel?.() ?? response.body?.destroy?.()) } catch { /* 丢弃正文即可 */ }
+    return status
+  } catch (error) {
+    const reason = error?.name === 'AbortError' ? `超时 ${timeoutMs}ms` : (error?.message || String(error))
+    throw new HuyaError(reason)
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+export function lastSegmentUrl(manifest, base) {
+  const lines = String(manifest || '').split('\n').map(line => line.trim()).filter(line => line && !line.startsWith('#'))
+  if (!lines.length) return ''
+  try { return new URL(lines[lines.length - 1], base).href } catch { return '' }
+}
+
+async function loadRoom(room, quality, ctx) {
+  const now = Number(ctx.now ?? Date.now())
+  const key = `${room}:${quality}`
+  const cached = roomCache.get(key)
+  if (cached && cached.expiresAt > now) return cached
+
+  let pending = roomPending.get(key)
+  if (!pending) {
+    pending = (async () => {
+      const data = await fetchRoom(room, { timeoutMs: ctx.timeoutMs, fetchImpl: ctx.fetchImpl })
+      const bitrate = selectBitrate(data.bitrates, quality)
+      const lines = data.streams
+        .filter(item => item?.sHlsUrl && item?.sHlsAntiCode)
+        .map((stream, index) => ({ cdn: String(stream.sCdnType || `line${index + 1}`), stream }))
+      if (!lines.length) throw new HuyaError(`虎牙房间 ${room} 当前没有 HLS 流`)
+      const entry = { expiresAt: now + RESOLVE_TTL_MS, name: data.name, presenterUid: data.presenterUid, bitrate, lines }
+      roomCache.set(key, entry)
+      return entry
+    })().finally(() => {
+      if (roomPending.get(key) === pending) roomPending.delete(key)
+    })
+    roomPending.set(key, pending)
+  }
+  return pending
+}
+
+function sessionsOf(key) {
+  let map = lineSessions.get(key)
+  if (!map) {
+    map = new Map()
+    lineSessions.set(key, map)
+  }
+  return map
+}
+
+/**
+ * 一条线路的签名地址在整个播放期间复用，不随 60 秒一次的房间页刷新重签。
+ * 实测（2026-10-24）：CDN 按「出口 IP + 流 + u」记会话，同一条流短时间内换上第 3 个 seqid 前后
+ * 就把整条线路拒掉几分钟（固定一个签名地址连拉 5 分钟 0 拒）；之前每分钟重签正是断流的根因。
+ * 只有流本身变了（主播重开、换地址、换档）才签新的；签名被拒时由 resolveFresh 决定重签还是换线。
+ */
+function lineSession(entry, key, line, now, { fresh = false } = {}) {
+  const sessions = sessionsOf(key)
+  const streamName = String(line.stream?.sStreamName || '')
+  const base = String(line.stream?.sHlsUrl || '')
+  const current = sessions.get(line.cdn)
+  if (!fresh && current && current.streamName === streamName && current.base === base && current.bitrate === entry.bitrate) {
+    return { ...current, reused: true }
+  }
+  const wsTime = parseInt(new URLSearchParams(String(line.stream?.sHlsAntiCode || '')).get('wsTime') || '', 16)
+  const session = {
+    url: signHlsUrl(line.stream, entry.presenterUid, entry.bitrate, now),
+    streamName,
+    base,
+    bitrate: entry.bitrate,
+    signedAt: now,
+    expiresAt: Number.isFinite(wsTime) ? wsTime * 1000 : 0,
+  }
+  sessions.set(line.cdn, session)
+  return { ...session, reused: false }
+}
+
+function rejectLine(room, cdn, now) {
+  let map = rejectedLines.get(room)
+  if (!map) {
+    map = new Map()
+    rejectedLines.set(room, map)
+  }
+  map.set(cdn, now + LINE_REJECT_MS)
+}
+
+/**
+ * 候选线路顺序：上次能播的线路优先，其余按房间页顺序；冷却中的线路跳过。
+ * 全部都在冷却时退回全部线路——总要试一条，万一 CDN 已经恢复。
+ */
+export function orderLines(lines, preferred, rejected, now) {
+  const ordered = [...lines].sort((a, b) => (a.cdn === preferred ? -1 : 0) - (b.cdn === preferred ? -1 : 0))
+  const available = ordered.filter(line => !(rejected?.get(line.cdn) > now))
+  return available.length ? available : ordered
+}
+
+/**
+ * 实测（2026-10-09）：房间页首选的 AL 线路播两三分钟后会对同一出口整条 403，
+ * 而同一房间页里的其它线路从同一出口仍然能播；TX 线路还出现过「清单 200、分片 403」。
+ * 2026-10-24 查明被拒的根因是每分钟重签（见 lineSession），签名地址改为播放期间复用。
+ * 每次播放请求都由这里取回清单：到期（wsTime）的签名被拒先在同一线路重签一次，
+ * 再被拒、或没到期的签名被拒都算线路被拒——立刻换下一条线路并把被拒线路冷却 5 分钟；刚签出来的地址先探一片分片
+ * 再交给播放器；清单直接随结果交回，本机中继不必再取一次。
+ */
+async function tryLine(url, probe, options) {
+  const manifest = await fetchManifest(url, options)
+  if (manifest.status !== 200) return { reason: `清单 HTTP ${manifest.status}`, status: manifest.status }
+  if (!manifest.text.trimStart().startsWith('#EXTM3U')) return { reason: '清单不是 HLS' }
+  if (probe) {
+    const segment = lastSegmentUrl(manifest.text, manifest.finalUrl)
+    const status = segment ? await probeSegment(segment, options) : 200
+    if (status !== 200) return { reason: `分片 HTTP ${status}`, status }
+  }
+  return { manifest }
+}
+
+async function resolveFresh(room, ctx) {
+  const now = Number(ctx.now ?? Date.now())
+  const quality = qualityFrom(ctx, QUALITY_OPTIONS, DEFAULT_QUALITY)
+  // 整个房间刚被判定全线不可用：短时间内直接回同一结论，别替播放器的连环重试去打上游
+  const failed = roomFailUntil.get(room)
+  if (failed && failed.until > now) throw new HuyaError(failed.desc)
+  const key = `${room}:${quality}`
+  const entry = await loadRoom(room, quality, ctx)
+  const options = { timeoutMs: ctx.timeoutMs, fetchImpl: ctx.fetchImpl }
+  const preferred = preferredLine.get(room)
+  const candidates = orderLines(entry.lines, preferred, rejectedLines.get(room), now)
+  const failures = []
+  for (const line of candidates) {
+    let session = lineSession(entry, key, line, now)
+    let reason = ''
+    let resigned = false
+    try {
+      let outcome = await tryLine(session.url, !session.reused, options)
+      if (outcome.reason && session.reused && outcome.status >= 400 && outcome.status < 500
+        && now >= session.expiresAt - SESSION_EXPIRY_MARGIN_MS) {
+        // 到期的签名被拒：用最新房间页的 wsTime 重签一次。别的播放请求可能已经抢先签过了，有就直接用它的
+        const latest = sessionsOf(key).get(line.cdn)
+        session = latest && latest.signedAt > session.signedAt
+          ? { ...latest, reused: false }
+          : lineSession(entry, key, line, now, { fresh: true })
+        resigned = true
+        outcome = await tryLine(session.url, true, options)
+      }
+      if (outcome.reason) reason = outcome.reason
+      else {
+        roomFailUntil.delete(room)
+        if (resigned) printYellow(`虎牙「${entry.name}」${line.cdn} 线路签名被拒，已重新签名继续播放`)
+        if (line.cdn !== preferred) {
+          preferredLine.set(room, line.cdn)
+          if (failures.length) printYellow(`虎牙「${entry.name}」${failures.join('、')}，已切换到 ${line.cdn} 线路`)
+        }
+        return {
+          url: session.url,
+          desc: `虎牙「${entry.name}」${bitrateLabel(entry.bitrate)}地址获取成功（${line.cdn} 线路）`,
+          relayHls: true,
+          manifestText: outcome.manifest.text,
+          manifestUrl: outcome.manifest.finalUrl,
+          upstreamHeaders: { Referer: REFERER, 'User-Agent': UA },
+        }
+      }
+    } catch (error) {
+      reason = error?.message || String(error)
+    }
+    failures.push(`${line.cdn} 线路${reason}`)
+    rejectLine(room, line.cdn, now)
+    sessionsOf(key).delete(line.cdn)
+    if (line.cdn === preferred) preferredLine.delete(room)
+  }
+  // 有的线路「首次取清单放行、再取就拒」，会让房间在换线成功与全线失败之间来回抖：
+  // 连续全线失败时把重试间隔逐次翻倍，别拿播放器的轮询节奏去打上游、也别刷屏
+  const desc = `虎牙「${entry.name}」所有线路都不可用：${failures.join('、')}`
+  const streak = (roomFailUntil.get(room)?.streak || 0) + 1
+  const delay = Math.min(ROOM_RETRY_MS * 2 ** (streak - 1), ROOM_RETRY_MAX_MS)
+  roomFailUntil.set(room, { until: now + delay, desc, streak })
+  printYellow(`${desc}，${Math.round(delay / 1000)} 秒后再试`)
+  throw new HuyaError(desc)
+}
+
+export async function resolveRoom(ref, ctx = {}) {
+  try {
+    const match = /^huya-([a-z0-9_-]{1,64})$/i.exec(String(ref || ''))
+    if (!match) return { url: '', desc: '虎牙房间引用格式错误' }
+    const room = normalizeRoom(match[1])
+    return await resolveFresh(room, ctx)
+  } catch (error) {
+    return { url: '', desc: error?.message || '虎牙播放地址获取失败' }
+  }
+}
+
+export function clearResolveCache() {
+  roomCache.clear()
+  roomPending.clear()
+  lineSessions.clear()
+  rejectedLines.clear()
+  preferredLine.clear()
+  roomFailUntil.clear()
+}

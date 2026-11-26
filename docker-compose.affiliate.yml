@@ -1,0 +1,22 @@
+# 二开版编排：从当前源码构建，不用官方镜像。
+# 用法：docker compose -f docker-compose.affiliate.yml up -d --build
+# 推广位配置单独只读挂载，改完 affiliate-links.json 刷新后台页面即生效，无需重建镜像或重启容器。
+services:
+  iptv:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: iptv-affiliate:local
+    container_name: iptv-affiliate
+    init: true
+    ports:
+      - "1905:1905"
+    environment:
+      - mport=1905
+      - mdataDir=/iptv/data
+      # - mAffiliateEnabled=false     # 取消注释可临时整体关闭推广位
+      # - mpass=yourpassword          # 可选：访问密码，设置后后台地址为 /密码/admin
+    volumes:
+      - ./data:/iptv/data
+      - ./affiliate-links.json:/iptv/affiliate-links.json:ro
+    restart: always

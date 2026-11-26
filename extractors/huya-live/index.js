@@ -1,0 +1,174 @@
+/** 虎牙直播：按分类自动加入热门房间，也支持手动固定房间。 */
+import {
+  AREA_PAGES,
+  DEFAULT_MIN_HEAT,
+  DEFAULT_QUALITY,
+  HUYA_GROUP,
+  HuyaOfflineError,
+  HuyaRoomMissingError,
+  QUALITY_OPTIONS,
+  clearResolveCache,
+  fetchRoom,
+  parseRoomList,
+  resolveRoom,
+  topRoomsOfArea,
+} from './api.js'
+
+const CONCURRENCY = 3
+
+async function mapLimit(items, limit, worker) {
+  const output = new Array(items.length)
+  let cursor = 0
+  async function run() {
+    while (cursor < items.length) {
+      const index = cursor++
+      output[index] = await worker(items[index], index)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, run))
+  return output
+}
+
+export function parseAreaNames(text) {
+  return String(text || '').split('\n').map(value => value.trim()).filter(Boolean)
+}
+
+export function mergeRooms(manual, automatic) {
+  const seen = new Set()
+  const merged = []
+  for (const room of [...(manual || []), ...(automatic || [])]) {
+    const id = String(room?.roomId || '')
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    merged.push(room)
+  }
+  return merged
+}
+
+function toChannel(room) {
+  return {
+    // 未开播的手动房间照样列出，播放时现查
+    name: room.offline ? `${room.nick || `虎牙 ${room.roomId}`} · 未开播` : room.name || `虎牙 ${room.roomId}`,
+    deferredRef: `huya-${room.roomId}`,
+    // 防盗链请求头由本机清单中继发送；不下发给播放器，TXT/TVBox 订阅也能保留。
+    // 清单由模块每次播放请求取回并随结果交给中继，线路被拒时才能当场换线。
+    relayHls: true,
+    logo: room.logo || '',
+    groupTitle: HUYA_GROUP,
+  }
+}
+
+export default {
+  id: 'huya-live',
+  name: '虎牙直播',
+  description: '按分类加入虎牙热门直播间，也可手动指定房间；播放时即时生成短期有效地址，线路被 CDN 拒绝时自动换线。',
+  category: 'live',
+  // 纯直播：地址上的查询参数（?quality= 等）不当回看参数拼进签名地址
+  capabilities: { cache: 'disk', resolve: true, epg: false, catchup: false },
+  defaultRefreshMinutes: 30,
+  minRefreshMinutes: 15,
+  maxRefreshMinutes: 120,
+
+  configSchema: [
+    {
+      key: 'topAreas',
+      section: '频道从哪来 —— 自动分类和手动房间可以同时使用，频道统一放入「虎牙」组',
+      group: '① 自动：按分类加入热门直播间',
+      label: '选择分类（可多选）',
+      type: 'multiselect',
+      options: Object.keys(AREA_PAGES).map(value => ({ value, label: value })),
+      default: '一起看',
+      hint: '默认只选「一起看」：从官网专区挑选已核验的影视正片房间，按当前标题和最低人气筛选。赛事、网游等分类按需自己勾选。只用手动房间时，每类数量填 0。',
+    },
+    {
+      key: 'topPerArea',
+      section: '频道从哪来 —— 自动分类和手动房间可以同时使用，频道统一放入「虎牙」组',
+      group: '① 自动：按分类加入热门直播间',
+      label: '每个分类取前几名',
+      type: 'int',
+      min: 0,
+      max: 20,
+      default: 8,
+      hint: '按当前人气从高到低，受最低人气过滤；填 0 只关闭自动分类。',
+    },
+    {
+      key: 'minHeat',
+      section: '频道从哪来 —— 自动分类和手动房间可以同时使用，频道统一放入「虎牙」组',
+      group: '① 自动：按分类加入热门直播间',
+      label: '最低人气',
+      type: 'int',
+      min: 0,
+      max: 100000000,
+      default: DEFAULT_MIN_HEAT,
+      hint: '虎牙人气不是实际在线人数。默认 3000，兼顾小型赛事并过滤低热度房间；填 0 不设门槛。',
+    },
+    {
+      key: 'rooms',
+      section: '频道从哪来 —— 自动分类和手动房间可以同时使用，频道统一放入「虎牙」组',
+      group: '② 手动：指定直播间',
+      label: '房间号 / 直播间地址（一行一个，可留空）',
+      type: 'text',
+      multiline: true,
+      placeholder: '660101\nhttps://www.huya.com/660101\n# 井号开头是注释',
+      hint: '数字房间号和英文房间短名都支持。手填房间排在自动分类之前；没开播的也会列出，名字带「未开播」，主播开播后直接能播，名字等下次刷新更新。',
+      default: '',
+    },
+    {
+      key: 'quality',
+      section: '播放偏好',
+      label: '优先画质',
+      type: 'select',
+      options: QUALITY_OPTIONS,
+      default: DEFAULT_QUALITY,
+      hint: '房间没有目标档时自动选择不高于目标的最接近档位。电视端默认 2M，在清晰度和稳定性之间更均衡。'
+        + '「原画 / 最高画质」在赛事等有 4K、2K 的房间会取最高档（4K 约 20M 码率，需要带宽和设备跟得上）；房间没有 4K、2K 时就是原画。'
+        + '单个频道可在播放地址末尾加 ?quality= 覆盖：0 最高、20000 4K、14000 2K、4000 蓝光、2000 超清、500 流畅。',
+    },
+  ],
+
+  async fetch(config, ctx = {}) {
+    const warnings = []
+    let hardErrors = 0
+    const manualRefs = parseRoomList(config.rooms)
+    const manual = (await mapLimit(manualRefs, CONCURRENCY, async room => {
+      try {
+        return await fetchRoom(room, { timeoutMs: ctx.timeoutMs, fetchImpl: ctx.fetchImpl })
+      } catch (error) {
+        // 未开播的手动房间也列出：频道播放时现查，主播开播后不用等下次刷新就能播
+        if (error instanceof HuyaOfflineError && error.room) return error.room
+        // 填错的房间号同未开播：提示并跳过，不算真出错
+        if (!(error instanceof HuyaOfflineError) && !(error instanceof HuyaRoomMissingError)) hardErrors++
+        warnings.push(error.message)
+        return null
+      }
+    })).filter(Boolean)
+
+    const automatic = []
+    if (Number(config.topPerArea) > 0) {
+      for (const area of parseAreaNames(config.topAreas)) {
+        try {
+          automatic.push(...await topRoomsOfArea(area, config.topPerArea, {
+            minHeat: config.minHeat,
+            timeoutMs: ctx.timeoutMs,
+            fetchImpl: ctx.fetchImpl,
+          }))
+        } catch (error) {
+          hardErrors++
+          warnings.push(`虎牙分类「${area}」抓取失败：${error.message}`)
+        }
+      }
+    }
+
+    const rooms = mergeRooms(manual, automatic)
+    // 「未开播」占位不算抓到：只剩它们又有真出错时整轮判失败、保上一轮缓存，和改之前一样
+    if (!rooms.some(room => !room.offline) && hardErrors > 0) throw new Error(warnings[0] || '虎牙直播抓取失败')
+    return {
+      groups: rooms.length ? [{ name: HUYA_GROUP, dataList: rooms.map(toChannel) }] : [],
+      meta: { skipped: warnings, warnings },
+    }
+  },
+
+  claimsRef: ref => /^huya-[a-z0-9_-]{1,64}$/i.test(String(ref || '')),
+  resolve: resolveRoom,
+  clearResolveCache,
+}

@@ -1,0 +1,855 @@
+import { createHash } from "node:crypto"
+import { readFileSync, existsSync, unlinkSync } from "node:fs"
+import { writeJsonFileSync } from "./fileUtil.js"
+import { dataPath } from "./paths.js"
+import { printBlue, printGreen, printYellow, printRed } from "./colorOut.js"
+import { enableTvgNormalize, enableDisplayNameUnify, externalLogoBase } from "../config.js"
+import { getCanonicalMap, normalizeKey, normalizeTvgName, getPlaybackChannelIds } from "./channelNormalize.js"
+import { matchKeywordGroup } from "./groupRulesAPI.js"
+import { normalizeHiddenRules, matchHiddenRule, createKeepFilter } from "./hiddenRules.js"
+import { matchSourceFallbackGroup } from "./sourceGroupFallback.js"
+import { collectOptsUntilUrl, renderOpts, needsOpts } from "./channelOpts.js"
+import { stripVolatileParams } from "./urlIdentity.js"
+import { parseCatchupAttrs, renderCatchupAttrs } from "./channelCatchup.js"
+import { markFengshowsLiveUrls } from "../extractors/fengshows/channels.js"
+import { ANNOUNCEMENT, isAnnouncementChannel, protectAnnouncementConfig, systemChannelByUrl } from "./announcement.js"
+
+// 台标来源分类（供后台展示）：本地上传 / 源自带 / 公共库兜底 / 无。
+// 依据 interface 里写出的 tvg-logo 形态判定，不联网、零额外成本。issue #38 / #40
+export function classifyLogo(logo) {
+  if (!logo) return 'none'
+  if (logo.startsWith('${replace}/logos/')) return 'local'                      // ${replace}/logos/<名>.<ext>（本地上传/手放，最高优先级）
+  if (logo.startsWith('${replace}/logo-pack/')) return 'pack'                    // 仓库内置台标（utils/logoPack.js）
+  // 本机托管的（utils/logoCache.js）：地址里的 from 记着它原本来自源自带还是公共库
+  if (logo.includes('/logo-cache/')) return /[?&]from=auto(?:&|$)/.test(logo) ? 'auto' : 'source'
+  if (externalLogoBase && logo.startsWith(externalLogoBase)) return 'auto'       // 公共台标库按名兜底
+  return 'source'                                                               // 咪咕 pics / m3u 源自带
+}
+
+// 多套配置档（大分组）：每台电视一套个性化定制。
+// - default 档沿用原 my-playlist-config.json（零迁移、向后兼容老部署）
+// - 其余档为 my-playlist-config.<slug>.json（slug 限 [a-z0-9_-]，直接进文件名，必须白名单防路径穿越）
+// - 档清单存在 my-playlist-profiles.json（仅存非默认档的 {id,name}；default 恒存在、隐式置顶）
+// 底层 interface.txt / playback.xml / 回看 全部多档共享，多档只是「同一全集的不同视图」。
+const PROFILES_PATH = dataPath('my-playlist-profiles.json')
+const PROFILE_ID_RE = /^[a-z0-9_-]{1,64}$/
+const DEFAULT_PROFILE = { id: 'default', name: '默认' }
+
+// 新建配置档的默认分组顺序。用户在后台手动拖拽后会写入
+// groupOrder，下方 applyConfig 仍以用户顺序为最终优先级。
+// 「央视频」排在咪咕的「央视」「卫视」之后：它匿名虽有 1080p，但官方线路起播慢、
+// 偶尔卡，播放器按名聚合成「源1 / 源2」时先走咪咕，央视频作备用（作者 09-27 调整）。
+const SPORTS_GROUPS = ['体育', '体育-昨天', '体育-今天', '体育-明天']
+export const DEFAULT_GROUP_ORDER = [
+  '公告',
+  ...SPORTS_GROUPS,
+  '赛事直播',
+  '央视', '卫视', '央视频', '亚太', '国际', '影视', '少儿', '教育', '娱乐时尚', '文旅', 'iPanda',
+  'B站', '抖音', '虎牙', '斗鱼',
+]
+
+const LOCAL_GROUP_NAMES = new Set([
+  '北京', '天津', '上海', '重庆',
+  '河北', '山西', '辽宁', '吉林', '黑龙江',
+  '江苏', '浙江', '安徽', '福建', '江西', '山东',
+  '河南', '湖北', '湖南', '广东', '海南',
+  '四川', '贵州', '云南', '陕西', '甘肃', '青海',
+  '内蒙古', '广西', '西藏', '宁夏', '新疆',
+  '香港', '澳门', '台湾',
+  '地方',
+  // 当前已接入的城市级模块；广州/深圳电视频道已并入广东。
+  '沈阳', '南京', '青岛', '广州', '深圳', '福州', '厦门',
+])
+
+// 景观 / 慢直播类分组：央视景观、北京景观、上海景观…吉林广电的「吉林风景」，以及市县台的「慢直播」。
+function isScenicGroup(name) {
+  return /景观|风景|慢直播/.test(String(name || ''))
+}
+
+// 按地市拆开的省内分组（「山东-济南」）：前缀是省名
+function provinceOfSubgroup(name) {
+  const match = /^([^-]+)-./.exec(String(name || '').trim())
+  return match && LOCAL_GROUP_NAMES.has(match[1]) ? match[1] : ''
+}
+
+export function isLocalGroup(name) {
+  const text = String(name || '').trim()
+  if (/(?:电视台|地市台)$/.test(text)) return true
+  if (provinceOfSubgroup(text)) return true
+  const bare = text.replace(/(?:电视台|地市台|频道)$/, '')
+  return LOCAL_GROUP_NAMES.has(bare)
+}
+
+/**
+ * 默认分组编排：内容类精确顺序 → 其他 → 景观慢直播 → 地方台连续区块置底。
+ * 地方台组数最多（二三十个省市），压在最后才不会把内容类挤出播放器首屏；
+ * 景观贴在地方台上方，作为「电视频道」与「地方台」之间的分隔带。
+ * 同一区块内保持来源原始顺序，避免每次刷新时频道乱跳。
+ */
+export function sortGroupsByDefault(groups) {
+  const priority = new Map(DEFAULT_GROUP_ORDER.map((name, index) => [name, index]))
+  const indexByName = new Map(groups.map((group, index) => [group?.name || '', index]))
+  return [...groups]
+    .map((group, originalIndex) => {
+      // 「山东-济南」这类省内分组紧跟在「山东」后面（同省的子分组之间保持来源顺序）
+      const parent = indexByName.get(provinceOfSubgroup(group?.name))
+      return { group, originalIndex: parent === undefined ? originalIndex : parent + (originalIndex + 1) / (groups.length + 1) }
+    })
+    .sort((a, b) => {
+      const nameA = a.group?.name || ''
+      const nameB = b.group?.name || ''
+      const exactA = priority.get(nameA)
+      const exactB = priority.get(nameB)
+      const bucketA = exactA !== undefined ? 0 : isScenicGroup(nameA) ? 2 : isLocalGroup(nameA) ? 3 : 1
+      const bucketB = exactB !== undefined ? 0 : isScenicGroup(nameB) ? 2 : isLocalGroup(nameB) ? 3 : 1
+      if (bucketA !== bucketB) return bucketA - bucketB
+      if (bucketA === 0 && exactA !== exactB) return exactA - exactB
+      return a.originalIndex - b.originalIndex
+    })
+    .map(item => item.group)
+}
+
+// 归一化档名：空 / 'default' / 非法 → 默认档（杜绝任意 profile 名经文件名注入）
+function normalizeProfile(profile) {
+  if (!profile || profile === 'default' || !PROFILE_ID_RE.test(profile)) return 'default'
+  return profile
+}
+
+function configPath(profile) {
+  const p = normalizeProfile(profile)
+  return p === 'default' ? dataPath('my-playlist-config.json') : dataPath(`my-playlist-config.${p}.json`)
+}
+
+/**
+ * 默认配置
+ */
+const DEFAULT_CONFIG = {
+  channelGroupMap: {},      // 单频道归类： "原始分组::频道ID" → 目标分组名
+  channelRenameMap: {},     // 单频道重命名： "原始分组::频道ID" → 新显示名
+  channelOrder: {},         // 组内频道顺序： 显示分组名 → ["原始分组::频道ID", ...]
+  hiddenChannels: [],       // 隐藏的频道ID列表
+  customGroups: [],         // 自定义分组 [{name, order, hidden?}]；hidden=true 为整组隐藏，见 getHiddenCustomGroupNames
+  groupOrder: [],           // 分组显示顺序
+  deletedGroups: [],        // 删除的分组名列表
+  groupRenameMap: {},       // 分组重命名映射 { 原始名: 新名 }
+  groupSortMode: {},        // 组内排序模式 { 显示分组名: 'name' }；'name'=按名称自动排序，缺省=手动(channelOrder)
+  disabledSources: [],      // 本档禁用的源（issue #29/#68）：['migu' | 'bi:<id>' | 'ext:<id>']，黑名单——新源默认全档可见
+  hiddenRules: [],          // 按名字长期屏蔽（issue #123）：[{value, mode:'exact'|'contains'}]，
+                            // 与 hiddenChannels 的区别是不绑频道 ID——源换址 / 频道每天重建都照样生效
+  keepRules: [],            // 只保留匹配项：写法同 hiddenRules，勾选来源里没命中的频道不出现（见 hiddenRules.js）
+  keepRuleSources: []       // 只保留规则管哪些来源：['migu' | 'bi:<id>' | 'ext:<id>' | 模块 id]；空 = 只保留规则不生效
+}
+
+// 时效 / 签名参数的剥离（issue #123）在 urlIdentity.js：自定义源经代理转发的频道引用也按它算，见 customSourceProxy.js
+
+export function buildChannelId({ groupName, channelName, tvgName, url }) {
+  const system = systemChannelByUrl(url)
+  if (system) return system.tvgId
+  if (!url) {
+    return createHash('sha1')
+      .update(`${groupName}\n${channelName}\n${tvgName || ''}`)
+      .digest('hex')
+      .slice(0, 16)
+  }
+
+  const miguRelayMatch = url.match(/^\$\{replace\}\/([^/?#]+)(?:\?[^#]*)?$/)
+  if (miguRelayMatch) {
+    return miguRelayMatch[1]
+  }
+
+  // 主键按「剥掉时效参数后的地址」算：源换签名不改频道身份，否则用户的隐藏 / 重命名 /
+  // 归类 / 排序会跟着每次刷新一起失效（issue #123）
+  return `ext-${createHash('sha1')
+    .update(`${groupName}\n${channelName}\n${tvgName || ''}\n${stripVolatileParams(url)}`)
+    .digest('hex')
+    .slice(0, 16)}`
+}
+
+/**
+ * 读取配置文件（profile 缺省/非法=默认档）
+ */
+export function readConfig(profile) {
+  const filePath = configPath(profile)
+  try {
+    if (!existsSync(filePath)) {
+      // 默认档缺失沿用旧提示；新建的空档（文件未生成）静默返回默认配置（空档=全集）
+      if (normalizeProfile(profile) === 'default') printYellow("播放列表配置文件不存在，使用默认配置")
+      return protectAnnouncementConfig(DEFAULT_CONFIG)
+    }
+
+    const content = readFileSync(filePath, 'utf-8')
+    const config = JSON.parse(content)
+
+    // 合并默认配置（防止配置文件缺少字段）
+    return protectAnnouncementConfig({
+      ...DEFAULT_CONFIG,
+      ...config
+    })
+  } catch (error) {
+    printRed(`读取播放列表配置失败: ${error.message}`)
+    return protectAnnouncementConfig(DEFAULT_CONFIG)
+  }
+}
+
+/**
+ * 保存配置文件（profile 缺省/非法=默认档）
+ */
+export function saveConfig(profile, config) {
+  try {
+    writeJsonFileSync(configPath(profile), protectAnnouncementConfig(config))
+    printGreen("播放列表配置已保存")
+    return { success: true }
+  } catch (error) {
+    printRed(`保存播放列表配置失败: ${error.message}`)
+    return { success: false, message: error.message }
+  }
+}
+
+/**
+ * 取 EXTINF 行的频道名：引号外的第一个逗号之后。
+ * 属性值里可以有逗号（回看模板 `rrsip=A,rrsip=B`，issue #200；外部源频道名写进
+ * tvg-id="…"），按第一个逗号切会把属性残渣当成频道名。
+ */
+function extinfName(line) {
+  let quoted = false
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] === '"') quoted = !quoted
+    else if (line[i] === ',' && !quoted) return line.slice(i + 1)
+  }
+  return ''
+}
+
+/**
+ * 解析 interface.txt 文件
+ */
+export function parseInterfaceTxt({ forTxt = false } = {}) {
+  try {
+    const interfacePath = dataPath('interface.txt')
+    if (!existsSync(interfacePath)) {
+      printYellow("interface.txt 不存在")
+      return []
+    }
+    
+    const content = readFileSync(interfacePath, 'utf-8')
+    const lines = (forTxt ? content : markFengshowsLiveUrls(content)).split('\n')
+    const groups = {}
+    const playbackIds = getPlaybackChannelIds()   // 解析一次：用于逐频道判定有无节目单（issue #38）
+
+    let currentGroup = null
+    
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim()
+      
+      // 跳过空行和文件头
+      if (!line || line.startsWith('#EXTM3U')) {
+        continue
+      }
+      
+      // 解析频道信息
+      if (line.startsWith('#EXTINF:')) {
+        const tvgIdMatch = line.match(/tvg-id="([^"]*)"/)
+        const tvgNameMatch = line.match(/tvg-name="([^"]*)"/)
+        const tvgLogoMatch = line.match(/tvg-logo="([^"]*)"/)
+        const groupMatch = line.match(/group-title="([^"]*)"/)
+        const sourceIdsMatch = line.match(/source-ids="([^"]*)"/)   // 源归属（issue #29/#68），内部属性
+        const catchup = parseCatchupAttrs(line)   // 频道级回看声明（issue #119 / #190）
+        const channelName = extinfName(line)
+
+        // 播放地址不一定紧跟 EXTINF——防盗链频道中间夹着 #EXTVLCOPT，
+        // 要连同 opts 一起收下，并把游标推到地址行，否则 opt 行会被当成播放地址。
+        const { opts, urlIndex } = collectOptsUntilUrl(lines, i)
+
+        if (groupMatch && channelName && urlIndex !== -1) {
+          const groupName = groupMatch[1]
+          const url = lines[urlIndex].trim()
+          
+          const tvgName = tvgNameMatch ? tvgNameMatch[1] : channelName
+          // 内部目录可声明迁移前的地址作为身份依据；真实播放仍使用下面的 url。
+          let identityUrl = ''
+          try { identityUrl = decodeURIComponent(line.match(/ identity-url="([^"\s]*)"/)?.[1] || '') } catch { /* 忽略坏属性 */ }
+          const channelId = buildChannelId({
+            groupName,
+            channelName,
+            tvgName,
+            url: identityUrl || url
+          })
+          
+          if (!groups[groupName]) {
+            groups[groupName] = []
+          }
+
+          const logo = tvgLogoMatch ? tvgLogoMatch[1] : ''
+          // 配对状态（issue #38）：让后台「我的频道」每个频道直接看到节目单 / 台标是否命中，不用逐个点开。
+          // 节目单：按订阅实际写出的 tvg-id（开启归一时取规范名）对 playback.xml 的 channel id 判定。
+          const canonical = enableTvgNormalize ? normalizeTvgName(tvgName) : null
+          const epgId = canonical || tvgName
+          const epgMatched = playbackIds.has(epgId) || playbackIds.has(channelName)
+
+          groups[groupName].push({
+            id: channelId,
+            name: channelName,
+            tvgId: tvgIdMatch ? tvgIdMatch[1] : '',
+            tvgName: tvgName,
+            logo,
+            logoStatus: classifyLogo(logo),       // local | source | auto | none
+            epgMatched,                            // 该频道是否有节目单
+            epgName: epgMatched ? epgId : '',      // 命中的规范名（详情里展示，解释「显示名虽特殊但已归一匹配」）
+            url: url,
+            originalGroup: groupName,
+            // 源归属（issue #29/#68 按档过滤）：来自哪些源（migu / bi:<id> / ext:<id>，去重并集）。
+            // 分号分隔（见 updateData 写入处）；旧数据无该属性 → 空数组=不过滤。
+            sourceIds: sourceIdsMatch ? sourceIdsMatch[1].split(';').filter(Boolean) : [],
+            ...catchup,
+            // 频道级播放选项（#EXTVLCOPT）：无则不带该字段，保持旧频道对象形状不变
+            ...(opts.length ? { opts } : {})
+          })
+
+          i = urlIndex // 跳过 opts 与 URL 行
+        }
+      }
+    }
+    
+    // 转换为数组格式
+    return Object.entries(groups).map(([name, channels]) => ({
+      name,
+      channels
+    }))
+    
+  } catch (error) {
+    printRed(`解析 interface.txt 失败: ${error.message}`)
+    return []
+  }
+}
+
+/**
+ * 检查分组是否被删除（支持通配符前缀匹配）
+ * deletedGroups 中以 * 结尾的条目会作为前缀匹配，例如 "体育-*" 匹配 "体育-昨天"、"体育-今天"、"体育-明天"
+ */
+function isGroupDeleted(groupName, deletedGroups) {
+  if (!deletedGroups || deletedGroups.length === 0) return false
+  return deletedGroups.some(pattern => {
+    if (pattern.endsWith('*')) {
+      return groupName.startsWith(pattern.slice(0, -1))
+    }
+    return pattern === groupName
+  })
+}
+
+/**
+ * 获取自定义分组名称
+ */
+function getCustomGroupNames(config) {
+  if (!Array.isArray(config?.customGroups)) {
+    return []
+  }
+
+  return config.customGroups
+    .map(group => typeof group === 'string' ? group : group?.name)
+    .map(name => typeof name === 'string' ? name.trim() : '')
+    .filter(Boolean)
+}
+
+/**
+ * 整组隐藏的自定义分组名（customGroups 里带 hidden: true 的；老格式的字符串条目没有隐藏状态）。
+ *
+ * 不写进 deletedGroups：那边按「源分组原名」判、支持 `前缀*` 通配，管不到移进来的频道；
+ * 自定义分组的隐藏状态记在分组自己身上，删除 / 改名分组时跟着走，不会留下孤儿条目，
+ * 把以后源里真出现的同名分组悄悄藏掉。
+ */
+export function getHiddenCustomGroupNames(config) {
+  if (!Array.isArray(config?.customGroups)) return []
+  return config.customGroups
+    .filter(group => group && typeof group === 'object' && group.hidden === true && typeof group.name === 'string')
+    .map(group => group.name.trim())
+    .filter(Boolean)
+}
+
+/**
+ * 列出分组配置里**所有**的重名冲突（[{ name, message }]，无冲突则为空数组）。
+ *
+ * 与 validateGroupConfig 的区别：后者只回报第一条。调用方拿到全量冲突后，可以和「盘上现有配置」
+ * 的冲突集合做差集，从而只拦截**本次改动新引入**的重名——早先合法建下、后来才被源变化撞上的旧冲突
+ * 不该把新增 / 改名 / 删除分组整个锁死（那会让用户以为「分组只能建一个」，报错还指着另一个分组名）。
+ */
+export function collectGroupConflicts(groups, config) {
+  config = protectAnnouncementConfig(config)
+  const renameMap = config?.groupRenameMap || {}
+  const hiddenRules = normalizeHiddenRules(config?.hiddenRules)   // 规整一次，循环内复用
+  const keepFilter = createKeepFilter(config?.keepRules, config?.keepRuleSources)
+  const occupiedNames = new Map([['未分组', '__reserved_ungrouped__']])
+  const conflicts = []
+
+  if (renameMap['未分组'] && renameMap['未分组'] !== '未分组') {
+    return [{ name: '未分组', message: '未分组不支持重命名' }]
+  }
+
+  for (const group of groups) {
+    // 该源分组在「应用隐藏 / 移动 / 删除后」是否还有属于自己的可见频道。
+    // 频道被全部移走、隐藏或整组删除后，该分组在「我的频道」里已看不到，就不应再占用其分组名，
+    // 否则把别的分组改名成它、或新建同名分组时会误报「分组已存在」却在列表里找不到它（issue #35）。
+    const stillVisible = group.channels.some(channel => {
+      const channelKey = `${group.name}::${channel.id}`
+      if (config?.hiddenChannels?.includes(channelKey)) return false      // 被隐藏
+      // 被名字规则屏蔽（issue #123）——与 applyConfig 的判定同源。漏了这条，
+      // 一个被规则清空的分组会继续占着分组名，用户改名 / 新建同名分组时误报「分组已存在」
+      // 却在列表里找不到它（就是 issue #35 那套症状）。
+      if (hiddenRules.length > 0
+          && matchHiddenRule([channel.name, config?.channelRenameMap?.[channelKey]], hiddenRules)) return false
+      // 被只保留规则排除——同上，与 applyConfig 同源
+      if (keepFilter && keepFilter([channel.name, config?.channelRenameMap?.[channelKey]], channel.sourceIds)) return false
+      if (config?.channelGroupMap?.[channelKey]) return false             // 被移动到别的分组
+      if (isGroupDeleted(group.name, config?.deletedGroups)) return false // 整组被删除
+      // 全部来源被本档禁用（issue #29/#68）——与 applyConfig 的过滤语义一致
+      if (Array.isArray(config?.disabledSources) && config.disabledSources.length > 0
+          && Array.isArray(channel.sourceIds) && channel.sourceIds.length > 0
+          && channel.sourceIds.every(id => config.disabledSources.includes(id))) return false
+      return true
+    })
+    if (!stillVisible) continue
+
+    const targetName = renameMap[group.name] || group.name
+    const existingGroup = occupiedNames.get(targetName)
+
+    if (existingGroup && existingGroup !== group.name) {
+      if (!(targetName === '未分组' && group.name === '未分组')) {
+        conflicts.push({ name: targetName, message: `分组 "${targetName}" 已存在` })
+        continue
+      }
+    }
+
+    if (group.name !== '未分组' && targetName === '未分组') {
+      conflicts.push({ name: targetName, message: `分组 "${targetName}" 已存在` })
+      continue
+    }
+
+    occupiedNames.set(targetName, group.name)
+  }
+
+  for (const customGroupName of getCustomGroupNames(config)) {
+    if (occupiedNames.has(customGroupName)) {
+      conflicts.push({ name: customGroupName, message: `分组 "${customGroupName}" 已存在` })
+      continue
+    }
+
+    occupiedNames.set(customGroupName, `custom:${customGroupName}`)
+  }
+
+  return conflicts
+}
+
+/**
+ * 校验分组配置是否会与现有分组重名（只回报第一条冲突）
+ */
+export function validateGroupConfig(groups, config) {
+  const [conflict] = collectGroupConflicts(groups, config)
+  return conflict ? { valid: false, message: conflict.message } : { valid: true }
+}
+
+/**
+ * 应用配置到频道列表
+ *
+ * options.hiddenCustomGroups：传入一个空数组时，整组隐藏的自定义分组会按 customGroups 顺序
+ * 填进去（[{ name, channels }]，没有频道的也列出），供后台「已隐藏」区展示和恢复；不传则直接丢弃。
+ */
+export function applyConfig(groups, config, { hiddenCustomGroups = null } = {}) {
+  try {
+    printBlue("应用播放列表配置...")
+    config = protectAnnouncementConfig(config)
+    // 整组隐藏的自定义分组：按「最终落到哪个分组」判——移进来的、自定义源直接写进来的、
+    // 按关键字规则归进来的频道都一起隐藏，和用户在列表里看到的这个分组一一对应。
+    const hiddenCustom = new Set(getHiddenCustomGroupNames(config))
+    const hiddenCustomChannels = {}
+
+    // 1. 构建频道映射（使用 分组名+频道ID 作为key，允许同一频道出现在不同分组中）
+    const channelMap = new Map()
+    groups.forEach(group => {
+      group.channels.forEach(channel => {
+        const key = `${group.name}::${channel.id}`
+        channelMap.set(key, { ...channel, originalGroup: group.name })
+      })
+    })
+    
+    // 2. 应用配置
+    const resultGroups = {}
+    const channelGroupMap = config.channelGroupMap || {}
+    const hiddenRules = normalizeHiddenRules(config.hiddenRules)   // 规整一次，循环内复用；无规则时零成本
+    const keepFilter = createKeepFilter(config.keepRules, config.keepRuleSources)   // 不生效时为 null
+
+    // EPG 名称规整（#39）/ 统一显示名（#56）共用「归一 key → 规范名」映射；构建一次循环内复用，getCanonicalMap 内部按文件 mtime 缓存
+    const canonicalMap = (enableTvgNormalize || enableDisplayNameUnify) ? getCanonicalMap() : null
+
+    // 遍历所有频道
+    channelMap.forEach((channel, key) => {
+      // 频道标识：原始分组名::频道ID（与 hiddenChannels / channelGroupMap 同源，避免重命名/同名错乱）
+      const channelKey = `${channel.originalGroup}::${channel.id}`
+      const originalName = channel.name   // 重命名前的源始名：名字规则要同时认它和改后的显示名
+
+      // 单频道重命名：覆盖显示名（只改 name，不动 tvgName，保 EPG 匹配）；channel 已是副本，可安全修改
+      const protectedAnnouncement = isAnnouncementChannel(channel)
+      const renamedName = protectedAnnouncement ? '' : config.channelRenameMap?.[channelKey]
+      if (renamedName) {
+        channel.name = renamedName
+      }
+
+      // 跳过隐藏的频道（按分组独立隐藏）。公告频道同样可隐藏：它只是不能删、不能挪、不能改名。
+      if (config.hiddenChannels?.includes(channelKey)) {
+        return
+      }
+
+      // 按名字长期屏蔽（issue #123）：hiddenChannels 绑频道 ID，而 ID 里含播放地址，
+      // 上游换路径就换 ID、那条隐藏静默失效；每天重建的赛事 / 事件直播更是压根没有稳定 ID。
+      // 规则按名字判，两种情况都盖得住。原始名与改后的显示名任一命中即隐藏——
+      // 用户可能照着界面上改过的名字配规则，也可能照着源里的原名配。
+      if (hiddenRules.length > 0 && matchHiddenRule([originalName, channel.name], hiddenRules)) {
+        return
+      }
+
+      // 只保留匹配项：勾选来源里的频道，原始名与显示名都没命中任何一条只保留规则就不出现，
+      // 源以后新加的频道也一样。没勾的来源不受影响（判定细节见 hiddenRules.js createKeepFilter）。
+      if (keepFilter && keepFilter([originalName, channel.name], channel.sourceIds)) {
+        return
+      }
+
+      // 按档禁用源（issue #29/#68）：该频道的**所有**来源都被本档禁用才隐藏——
+      // 多源提供的同一频道只要有一个来源未禁用就保留；旧 interface.txt 无源标记（sourceIds 空）→ 不过滤。
+      if (Array.isArray(config.disabledSources) && config.disabledSources.length > 0
+          && Array.isArray(channel.sourceIds) && channel.sourceIds.length > 0
+          && channel.sourceIds.every(id => config.disabledSources.includes(id))) {
+        return
+      }
+
+      // 单频道归类：被移动到其它分组的频道，目标分组优先级最高
+      const movedTo = protectedAnnouncement ? '' : channelGroupMap[channelKey]
+
+      // 跳过已删除分组的频道（支持通配符前缀匹配）；已被移动到别处的频道予以保留
+      if (!protectedAnnouncement && !movedTo && isGroupDeleted(channel.originalGroup, config.deletedGroups)) {
+        return
+      }
+
+      // 目标分组优先级：单频道移动 > 关键字自动分组(仅未分组) > 分组重命名 > 原始分组
+      let targetGroup
+      if (movedTo) {
+        targetGroup = movedTo
+      } else {
+        targetGroup = channel.originalGroup
+        if (targetGroup === '未分组') {
+          // 关键字自动分组（issue #69）：只对「未分组」频道按名字子串匹配规则（首条命中胜），
+          // 让自定义源里没写分组、每次刷新又回到未分组的新频道自动归位；不动源已分好的组。
+          // 规则未命中时，勾选「忽略源自带分组」的源按其默认分组兜底（issue #110）。
+          const kw = matchKeywordGroup(channel.name) || matchSourceFallbackGroup(channel.sourceIds)
+          if (kw) targetGroup = kw
+        } else if (!protectedAnnouncement && config.groupRenameMap && config.groupRenameMap[targetGroup]) {
+          targetGroup = config.groupRenameMap[targetGroup]
+        }
+      }
+
+      // EPG 名称规整（issue #39）：把 tvg-id / tvg-name 归一到规范名（= EPG/playback.xml 里的频道名），
+      // 让异构外部源频道也能匹配上节目单。
+      // 统一显示名（issue #56）：开关开启且未手动重命名时，把显示名也归一到规范名，
+      // 让不同源「CCTV1 / CCTV-1 / CCTV1综合」按规则批量统一成同一个名字。
+      if (canonicalMap) {
+        const canonical = canonicalMap.get(normalizeKey(channel.tvgName || channel.name))
+        if (canonical) {
+          if (enableTvgNormalize) {
+            channel.tvgId = canonical
+            channel.tvgName = canonical
+          }
+          if (enableDisplayNameUnify && !renamedName) {
+            channel.name = canonical
+          }
+        }
+      }
+
+      // 放在名称规整之后：「已隐藏」区里显示的名字要和隐藏前一样
+      if (!protectedAnnouncement && hiddenCustom.has(targetGroup)) {
+        (hiddenCustomChannels[targetGroup] ||= []).push(channel)
+        return
+      }
+
+      if (!resultGroups[targetGroup]) {
+        resultGroups[targetGroup] = []
+      }
+      resultGroups[targetGroup].push(channel)
+    })
+
+    // 3. 补齐自定义空分组（整组隐藏的不补）
+    getCustomGroupNames(config).forEach(groupName => {
+      if (!resultGroups[groupName] && !hiddenCustom.has(groupName)) {
+        resultGroups[groupName] = []
+      }
+    })
+
+    // 4. 转换为数组并排序
+    let result = Object.entries(resultGroups)
+      .map(([name, channels]) => ({ name, channels }))
+
+    // 先套用系统默认顺序；下方若有用户 groupOrder，会再覆盖它。
+    result = sortGroupsByDefault(result)
+    
+    // 5. 应用分组排序
+    if (config.groupOrder && config.groupOrder.length > 0) {
+      const configuredIndex = name => {
+        const direct = config.groupOrder.indexOf(name)
+        // 「纪实」已更名为「文旅」；旧配置档不需重新拖拽也能沿用原位置。
+        if (direct === -1 && name === '文旅') return config.groupOrder.indexOf('纪实')
+        // 「央视频」是后来新增的系统来源，作咪咕的备用（见 DEFAULT_GROUP_ORDER）。
+        // 旧配置档尚未记录它时跟在卫视后，没有卫视就跟在央视后；
+        // 一旦用户显式拖拽保存，direct 会优先尊重用户位置。
+        if (direct === -1 && name === '央视频') {
+          const satellite = config.groupOrder.indexOf('卫视')
+          if (satellite !== -1) return satellite + 0.5
+          const cctv = config.groupOrder.indexOf('央视')
+          if (cctv !== -1) return cctv + 0.5
+        }
+        // iPanda 是后来新增的内容来源；旧配置没有记录它时跟在文旅后。
+        if (direct === -1 && name === 'iPanda') {
+          const culture = config.groupOrder.indexOf('文旅')
+          if (culture !== -1) return culture + 0.5
+          const documentary = config.groupOrder.indexOf('纪实')
+          if (documentary !== -1) return documentary + 0.5
+        }
+        // 新增抖音直播时，旧配置档里尚无此组；默认贴在 B 站后面。
+        if (direct === -1 && name === '抖音') {
+          const bilibili = config.groupOrder.indexOf('B站')
+          if (bilibili !== -1) return bilibili + 0.5
+        }
+        // 「赛事直播」是后来新增的；旧配置档没记录它时跟在体育几组后面
+        if (direct === -1 && name === '赛事直播') {
+          const sports = Math.max(...SPORTS_GROUPS.map(group => config.groupOrder.indexOf(group)))
+          if (sports !== -1) return sports + 0.5
+        }
+        // 「山东-济南」这类省内分组没记录过时跟在该省后面（同值靠稳定排序保持默认顺序）
+        if (direct === -1 && provinceOfSubgroup(name)) {
+          const province = config.groupOrder.indexOf(provinceOfSubgroup(name))
+          if (province !== -1) return province + 0.5
+        }
+        return direct
+      }
+      result.sort((a, b) => {
+        const indexA = configuredIndex(a.name)
+        const indexB = configuredIndex(b.name)
+        
+        // 如果都在排序列表中，按列表顺序
+        if (indexA !== -1 && indexB !== -1) {
+          return indexA - indexB
+        }
+        
+        // 如果只有A在列表中，A在前
+        if (indexA !== -1) return -1
+        
+        // 如果只有B在列表中，B在前
+        if (indexB !== -1) return 1
+        
+        // 都不在列表中，保持原顺序
+        return 0
+      })
+    }
+
+    // 系统公告只要还在（未被隐藏）就固定在首位；无论旧配置、手工改 JSON 还是将来 UI 回归，都不能下移。
+    const announcementIndex = result.findIndex(group => group.name === ANNOUNCEMENT.group)
+    if (announcementIndex > 0) result.unshift(...result.splice(announcementIndex, 1))
+
+    // 6. 应用组内频道排序：groupSortMode='name' 的组按名称自动排序（中文按拼音、含数字按数值，
+    //    依赖 Node full-ICU），否则按手动拖拽顺序 channelOrder（显示分组名 → ["原始分组::频道ID"]）。
+    const channelOrder = config.channelOrder || {}
+    const groupSortMode = config.groupSortMode || {}
+    const hiddenResult = Array.isArray(hiddenCustomGroups)
+      ? [...hiddenCustom].map(name => ({ name, channels: hiddenCustomChannels[name] || [] }))
+      : []
+    ;[...result, ...hiddenResult].forEach(group => {
+      if (groupSortMode[group.name] === 'name') {
+        group.channels.sort((a, b) => (a.name || '').localeCompare(b.name || '', 'zh', { numeric: true }))
+        return
+      }
+      const order = channelOrder[group.name]
+      if (Array.isArray(order) && order.length > 0) {
+        group.channels = sortChannelsByOrder(group.channels, order)
+      }
+    })
+
+    if (Array.isArray(hiddenCustomGroups)) hiddenCustomGroups.push(...hiddenResult)
+
+    const totalChannels = result.reduce((sum, g) => sum + g.channels.length, 0)
+    printGreen(`配置应用完成: ${result.length} 个分组, ${totalChannels} 个频道`)
+
+    return result
+    
+  } catch (error) {
+    printRed(`应用配置失败: ${error.message}`)
+    return groups // 返回原始数据
+  }
+}
+
+/** 同名比对口径：去首尾空白、不分大小写（与后台「同名线路」面板的 sameNameKey 一致） */
+function sameNameKey(name) {
+  return String(name || '').trim().toLowerCase()
+}
+
+/**
+ * 按手动排序（channelOrder 里的 ["原始分组::频道ID", ...]）排一个分组的频道，返回新数组。
+ *
+ * 不在顺序表里的频道是上次排序之后才出现的：新加的源，或者订阅源换了地址的线路（ID 含地址）。
+ * 原先一律排到组尾；和已排好的某个频道同名时，改为紧跟在它最后一条同名线路后面——聚合订阅换了
+ * 地址，同一台的几条线路仍挨在一起，不会有一条掉到几十个频道之后。没有同名的仍按原先相对顺序排到组尾。
+ */
+export function sortChannelsByOrder(channels, order) {
+  const rank = new Map()
+  order.forEach((key, i) => { if (!rank.has(key)) rank.set(key, i) })
+  const keyOf = channel => `${channel.originalGroup}::${channel.id}`
+  const result = channels
+    .filter(channel => rank.has(keyOf(channel)))
+    .sort((a, b) => rank.get(keyOf(a)) - rank.get(keyOf(b)))
+  const tail = []
+  for (const channel of channels) {
+    if (rank.has(keyOf(channel))) continue
+    const name = sameNameKey(channel.name)
+    let at = -1
+    for (let i = result.length - 1; i >= 0; i--) {
+      if (sameNameKey(result[i].name) === name) { at = i; break }
+    }
+    if (at === -1) tail.push(channel)
+    else result.splice(at + 1, 0, channel)
+  }
+  return [...result, ...tail]
+}
+
+/**
+ * 生成 M3U8 格式内容
+ */
+export function generateM3u8(groups) {
+  let content = '#EXTM3U x-tvg-url="${replace}/playback.xml" catchup="append" catchup-source="?playbackbegin=${(b)yyyyMMddHHmmss}&playbackend=${(e)yyyyMMddHHmmss}"\n'
+  
+  groups.forEach(group => {
+    group.channels.forEach(channel => {
+      const catchupAttr = renderCatchupAttrs(channel)
+      content += `#EXTINF:-1 tvg-id="${channel.tvgId}" tvg-name="${channel.tvgName}" tvg-logo="${channel.logo}"${catchupAttr} group-title="${group.name}",${channel.name}\n`
+      // 防盗链频道的请求头必须夹在 EXTINF 和地址之间；无 opts 时为空串，输出不变
+      content += renderOpts(channel.opts)
+      content += `${channel.url}\n`
+    })
+  })
+  
+  return content
+}
+
+/**
+ * 生成 TXT 格式内容
+ */
+export function generateTxt(groups) {
+  let content = ''
+  
+  groups.forEach(group => {
+    // txt 只有「频道名,地址」两列，放不下请求头——依赖 opts 的频道写进去必定 403，跳过
+    const lines = group.channels
+      .filter(channel => !needsOpts(channel))
+      .map(channel => `${channel.name},${channel.url}\n`)
+    // 整组都被跳过时连分组头也不写，免得 TVBox 里多一个空分类（订阅源勾了「播放时也带上 UA」常见，issue #170）
+    if (lines.length) content += `${group.name},#genre#\n` + lines.join('')
+  })
+  
+  return content
+}
+
+// ---- 配置档（profile）管理 ----
+// 注册表只存非默认档的 {id, name}；default 档恒存在、隐式置顶。
+
+function readProfilesRegistry() {
+  try {
+    if (!existsSync(PROFILES_PATH)) return []
+    const data = JSON.parse(readFileSync(PROFILES_PATH, 'utf-8'))
+    const list = Array.isArray(data?.profiles) ? data.profiles : []
+    return list
+      .filter(p => p && PROFILE_ID_RE.test(p.id) && p.id !== 'default')
+      .map(p => ({ id: p.id, name: (typeof p.name === 'string' && p.name.trim()) ? p.name.trim() : p.id }))
+  } catch (error) {
+    printRed(`读取配置档列表失败: ${error.message}`)
+    return []
+  }
+}
+
+function writeProfilesRegistry(profiles) {
+  const extra = profiles
+    .filter(p => p.id !== 'default')
+    .map(p => ({ id: p.id, name: p.name }))
+  writeJsonFileSync(PROFILES_PATH, { profiles: extra })
+}
+
+/** 列出所有配置档（default 恒在首位） */
+export function listProfiles() {
+  return [DEFAULT_PROFILE, ...readProfilesRegistry()]
+}
+
+/** 新建配置档：fromProfile 指定时复制其配置（含 default），否则空配置（=全集） */
+export function createProfile({ id, name, fromProfile } = {}) {
+  if (!PROFILE_ID_RE.test(id || '')) {
+    return { success: false, message: '档名只能用小写字母、数字、_ 或 -，长度 1-64' }
+  }
+  if (id === 'default') {
+    return { success: false, message: 'default 为系统保留档名' }
+  }
+  const displayName = (typeof name === 'string' && name.trim()) ? name.trim() : id
+  if (displayName.length > 20) {
+    return { success: false, message: '档名不能超过 20 个字符' }
+  }
+  const existing = readProfilesRegistry()
+  if (existing.some(p => p.id === id)) {
+    return { success: false, message: `配置档 "${id}" 已存在` }
+  }
+  const baseConfig = (fromProfile !== undefined && fromProfile !== null && fromProfile !== '')
+    ? readConfig(fromProfile)
+    : { ...DEFAULT_CONFIG }
+  const saveRes = saveConfig(id, baseConfig)
+  if (!saveRes.success) return saveRes
+  writeProfilesRegistry([...existing, { id, name: displayName }])
+  return { success: true, profile: { id, name: displayName } }
+}
+
+/** 重命名配置档（仅改显示名，id/文件名不变） */
+export function renameProfile({ id, name } = {}) {
+  if (id === 'default') return { success: false, message: '默认档不可改名' }
+  const existing = readProfilesRegistry()
+  const idx = existing.findIndex(p => p.id === id)
+  if (idx === -1) return { success: false, message: `配置档 "${id}" 不存在` }
+  const displayName = (typeof name === 'string' && name.trim()) ? name.trim() : id
+  if (displayName.length > 20) return { success: false, message: '档名不能超过 20 个字符' }
+  existing[idx] = { id, name: displayName }
+  writeProfilesRegistry(existing)
+  return { success: true, profile: { id, name: displayName } }
+}
+
+/** 删除配置档（连同其配置文件） */
+export function deleteProfile(id) {
+  if (id === 'default') return { success: false, message: '默认档不可删除' }
+  const existing = readProfilesRegistry()
+  if (!existing.some(p => p.id === id)) {
+    return { success: false, message: `配置档 "${id}" 不存在` }
+  }
+  writeProfilesRegistry(existing.filter(p => p.id !== id))
+  try {
+    const filePath = configPath(id)
+    if (existsSync(filePath)) unlinkSync(filePath)
+  } catch (error) {
+    printYellow(`配置档已从列表移除，但删除其文件失败: ${error.message}`)
+  }
+  return { success: true }
+}
+
+// 导出 isGroupDeleted 供管理后台API使用
+export { isGroupDeleted }
+
+export default {
+  readConfig,
+  saveConfig,
+  parseInterfaceTxt,
+  validateGroupConfig,
+  collectGroupConflicts,
+  getHiddenCustomGroupNames,
+  applyConfig,
+  generateM3u8,
+  generateTxt,
+  isGroupDeleted,
+  listProfiles,
+  createProfile,
+  renameProfile,
+  deleteProfile
+}

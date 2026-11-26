@@ -1,0 +1,86 @@
+{
+  "_note": "推广位配置：改完保存、刷新后台页面即生效，无需重启服务。enabled 设为 false 或设置环境变量 mAffiliateEnabled=false 可整体关闭。只接受 https:// 链接。文案请保持如实，不要写平台未承诺的收益。",
+  "enabled": true,
+  "title": {
+    "zh": "站长推荐 · 自用资源",
+    "en": "Recommended · Tools We Actually Use"
+  },
+  "subtitle": {
+    "zh": "下面是本站自己在用的云服务和工具，链接含邀请码。用不用都行，页面里写清楚了各自的限制和风险。",
+    "en": "Cloud services and tools this site actually uses. These links contain a referral code. No pressure — the limits and risks are spelled out below."
+  },
+  "disclosure": {
+    "zh": "以上均为推广 / 邀请链接。通过链接注册或购买，站长可能从平台获得返佣，不会额外增加你的费用；邀请链接本身不会提高注册者收益。价格、优惠、可用性与收益均以各平台官方页面和条款为准，请自行判断后再决定。",
+    "en": "All links above are affiliate / referral links. If you sign up or make a purchase through them, the site owner may receive a commission from the platform at no extra cost to you. A referral link does not increase your own earnings. Prices, discounts, availability and payouts are governed by each platform's official pages and terms — please make your own judgement."
+  },
+  "links": [
+    {
+      "id": "traffmonetizer",
+      "glyph": "TM",
+      "accent": "#7a5af8",
+      "url": "https://traffmonetizer.io/?aff=2177804",
+      "name": { "zh": "TraffMonetizer", "en": "TraffMonetizer" },
+      "tag": { "zh": "闲置带宽 · 有实测", "en": "Idle bandwidth · Tested" },
+      "desc": {
+        "zh": "把闲置上行带宽分享出去换收益。我们在服务器上用 Docker 真跑过一遍：官方镜像约 4.2 MB，容器内存约 1 MB，跑完删容器磁盘零残留。",
+        "en": "Share unused upload bandwidth for a small income. We ran the official Docker image on a real server: about 4.2 MB image, ~1 MB container memory, zero disk residue after removal."
+      },
+      "warning": {
+        "zh": "重要限制：官方条款只允许住宅 IP，明确禁止服务器、VPN 和代理；用 VPS 挂机可能封号或拒付。邀请链接只是归因 ID，不给注册者额外奖励，$5 注册奖励已于 2024-03-01 取消。最低提现 $10。",
+        "en": "Important: the Terms allow residential IP addresses only and explicitly ban servers, VPNs and proxies — running it on a VPS risks account closure or withheld payouts. The referral ID gives you no signup bonus; the $5 bonus was removed on 2024-03-01. Minimum payout is $10."
+      },
+      "cta": { "zh": "前往注册", "en": "Create an account" },
+      "more": { "zh": "看实测与提现核查", "en": "Read the hands-on test" },
+      "moreUrl": "https://www.quanyixia.com/traffmonetizer-vps-test/",
+      "moreUrlEn": "https://www.quanyixia.com/en/traffmonetizer-cashout-test-en/"
+    },
+    {
+      "id": "siliconflow",
+      "glyph": "SF",
+      "accent": "#2563eb",
+      "url": "https://cloud.siliconflow.cn/i/v4ZWgAAz",
+      "name": { "zh": "硅基流动 SiliconFlow", "en": "SiliconFlow" },
+      "tag": { "zh": "大模型 API", "en": "LLM API" },
+      "desc": {
+        "zh": "国内可直接调用的大模型推理平台，把各家开源模型聚合成统一 API。做自动化脚本、内容处理、AI 小工具时用来省掉自己搭推理环境。",
+        "en": "A model-inference platform that exposes popular open-weight LLMs behind one API. Handy for automation scripts, content processing and small AI tools without hosting your own runtime."
+      },
+      "cta": { "zh": "前往了解", "en": "Explore the platform" },
+      "more": { "zh": "官网文档", "en": "Official docs" },
+      "moreUrl": "https://docs.siliconflow.cn/",
+      "moreUrlEn": "https://docs.siliconflow.cn/en/"
+    },
+    {
+      "id": "aliyun",
+      "glyph": "AL",
+      "accent": "#ff6a00",
+      "url": "https://www.aliyun.com/minisite/goods?userCode=psiuy2ps",
+      "name": { "zh": "阿里云", "en": "Alibaba Cloud" },
+      "tag": { "zh": "云服务器 · 活动价", "en": "Cloud servers · Deals" },
+      "desc": {
+        "zh": "自建服务、Docker 项目、镜像加速和对象存储都能用。活动页常有轻量应用服务器的入门机型，适合拿来练手部署。",
+        "en": "Useful for self-hosted services, Docker projects, registry mirrors and object storage. The deals page usually lists entry-level instances that are cheap enough for a first deployment."
+      },
+      "cta": { "zh": "查看活动", "en": "See current deals" },
+      "more": { "zh": "建站与部署实录", "en": "Deployment write-ups" },
+      "moreUrl": "https://www.quanyixia.com/",
+      "moreUrlEn": "https://www.quanyixia.com/en/"
+    },
+    {
+      "id": "tencentcloud",
+      "glyph": "TC",
+      "accent": "#0a8f5b",
+      "url": "https://curl.qcloud.com/N9GuTW2L",
+      "name": { "zh": "腾讯云", "en": "Tencent Cloud" },
+      "tag": { "zh": "轻量服务器 · 优惠", "en": "Lighthouse · Offers" },
+      "desc": {
+        "zh": "轻量应用服务器开箱即用，国内访问和备案配套比较顺手；也常用作自建工具的备用节点。具体配置和价格以活动页为准。",
+        "en": "Lighthouse instances are ready to use out of the box and pair well with domestic hosting requirements; also a common choice for a secondary self-hosted node. Check the campaign page for current specs and pricing."
+      },
+      "cta": { "zh": "查看优惠", "en": "View offers" },
+      "more": { "zh": "自建项目清单", "en": "Self-hosted projects" },
+      "moreUrl": "https://www.quanyixia.com/",
+      "moreUrlEn": "https://www.quanyixia.com/en/"
+    }
+  ]
+}

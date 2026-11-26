@@ -1,0 +1,12 @@
+{
+  "enabled": true,
+  "sources": [
+    {
+      "name": "我的EPG",
+      "url": "https://example.com/epg.xml.gz",
+      "enabled": true,
+      "format": "auto",
+      "priority": 10
+    }
+  ]
+}

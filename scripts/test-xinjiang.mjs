@@ -1,0 +1,381 @@
+#!/usr/bin/env node
+import assert from 'node:assert/strict'
+import { createHash, generateKeyPairSync } from 'node:crypto'
+
+import xinjiang from '../extractors/xinjiang/index.js'
+import {
+  CHANNELS,
+  XINJIANG_CHANNEL_ENDPOINT,
+  XINJIANG_PAGE,
+  XINJIANG_TIMESTAMP_URL,
+  buildChannels,
+  claimsRef,
+  createResolver,
+  officialAssetUrl,
+  officialHlsUrl,
+  parseChannelList,
+  upstreamHeadersFor,
+  validateHls,
+} from '../extractors/xinjiang/api.js'
+import {
+  createSignedParams,
+  extractSigningMaterial,
+  scriptUrls,
+  shanghaiDate,
+} from '../extractors/xinjiang/signing.js'
+import { getModule, resolverFor } from '../extractors/registry.js'
+
+let passed = 0
+const check = (name, fn) => { fn(); passed++; console.log(`  ✅ ${name}`) }
+const checkAsync = async (name, fn) => { await fn(); passed++; console.log(`  ✅ ${name}`) }
+const response = (body, status = 200, headers = {}) => new Response(
+  typeof body === 'string' ? body : JSON.stringify(body),
+  { status, headers },
+)
+
+const now = Date.parse('2029-01-01T00:00:00Z')
+const expiry = Math.floor(Date.parse('2030-01-01T00:00:00Z') / 1000)
+const uuid = '123e4567-e89b-42d3-a456-426614174000'
+const authFor = suffix => `${expiry}-3-3-${String(suffix).padStart(32, '0')}`
+const apiPayload = () => ({
+  success: true,
+  data: [
+    ...CHANNELS.map((channel, index) => ({
+      Id: Number(channel.channelId),
+      SimpleName: channel.callSign,
+      IsForbidden: false,
+      PlayStreamUrl: `https://slstplay.xjtvs.com.cn${channel.path}?auth_key=${authFor(index + 1)}&aliyun_uuid=${uuid}`,
+    })),
+    // 官网另有的频道（如 XJTV-6）不认
+    { Id: 19, SimpleName: 'XJTV-6', IsForbidden: true, PlayStreamUrl: null },
+  ],
+})
+
+const { publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 })
+const pem = publicKey.export({ type: 'spki', format: 'pem' }).trim()
+// 官网真实形态：字符串数组 + 带偏移的解码器 + 加载时按自检表达式旋转数组。
+// 数组源码顺序被预先转过，自检表达式只有转满 12 档才对得上，正好覆盖「必须定出唯一旋转」这条。
+// date / random_string / random_number 三个键名都藏在表里，官网已不再留 .random_string= 这类字面量。
+const signingBundle = `
+function Seeds(){const t=["date","abcdefghijklmnopqrstuvwxyzABCDEFGH","random_number","2029-01-03","2029-01-02","2029-01-05","24","36","48","60","noise2","noise3","noise","random_string","2029-01-01"];return Seeds=function(){return t},Seeds()}
+function decode(x,y){return x=x-400,Seeds()[x]}
+const T=decode;
+(function(t,e){const n=decode,r=t();for(;;)try{if(parseInt(n(409))/1*parseInt(n(410))/2+parseInt(n(411))/4*(-parseInt(n(412))/8)+-parseInt(n(402))/1===e)break;r.push(r.shift())}catch(s){r.push(r.shift())}})(Seeds,-1687);
+const row={};row[T(403)]=T(402);row[T(401)]=T(404);row[T(405)]=4;
+const inline={};inline[T(403)]="2029-01-03",inline[T(401)]=T(404),inline[T(405)]=7;
+const rows=[row,inline],endpoint="TVChannelList",key=\`${pem}\`;
+`
+
+console.log('新疆广电模块测试')
+
+check('模块注册为免账号的新疆清单中继模块', () => {
+  assert.equal(getModule('xinjiang'), xinjiang)
+  assert.equal(xinjiang.name, '新疆')
+  assert.equal(xinjiang.category, undefined)
+  assert.equal(xinjiang.channelHlsMode, 'relay')
+  assert.equal(xinjiang.relayProxyCompatible, true)
+  assert.equal(xinjiang.capabilities.catchup, false)
+  assert.equal(xinjiang.catalogVersion, 2)
+  assert.deepEqual(xinjiang.configSchema, [])
+  assert.equal(resolverFor('xjtv-1'), xinjiang)
+  assert.equal(resolverFor('xjtv-8'), xinjiang)
+  assert.equal(resolverFor('xjtv-1/extra'), null)
+})
+
+await checkAsync('官网七路公开频道固定输出为独立新疆分组', async () => {
+  assert.deepEqual(CHANNELS.map(channel => [channel.channelId, channel.callSign]), [
+    ['1', 'XJTV-1'],
+    ['3', 'XJTV-2'],
+    ['4', 'XJTV-3'],
+    ['16', 'XJTV-4'],
+    ['17', 'XJTV-5'],
+    ['21', 'XJTV-7'],
+    ['23', 'XJTV-8'],
+  ])
+  assert.deepEqual(CHANNELS.map(channel => channel.name), [
+    '新疆卫视', '维吾尔语新闻综合', '哈萨克语新闻综合', '新疆汉语综艺', '维吾尔语影视', '新疆体育健康', '新疆少儿',
+  ])
+  const channels = buildChannels()
+  assert.deepEqual(channels.map(channel => channel.deferredRef), [
+    'xjtv-1', 'xjtv-2', 'xjtv-3', 'xjtv-4', 'xjtv-5', 'xjtv-7', 'xjtv-8',
+  ])
+  assert.ok(channels.every(channel => channel.catchup === 'none'))
+  assert.equal(claimsRef('xjtv-4'), true)
+  assert.equal(claimsRef('xjtv-6'), false)
+  const result = await xinjiang.fetch()
+  assert.deepEqual(result.groups, [{ name: '新疆', dataList: channels }])
+})
+
+check('静态解析当天签名配置，不执行官网脚本', () => {
+  const material = extractSigningMaterial(signingBundle, '2029-01-01')
+  assert.equal(material.date, '2029-01-01')
+  assert.equal(material.random_string, 'abcdefghijklmnopqrstuvwxyzABCDEFGH')
+  assert.equal(material.random_number, 4)
+  assert.equal(material.publicKey, pem)
+  assert.throws(() => extractSigningMaterial(signingBundle, '2029-01-02'), /没有 2029-01-02/)
+})
+
+check('当天日期直接写成字面量、不在字符串表里时也能解析', () => {
+  const material = extractSigningMaterial(signingBundle, '2029-01-03')
+  assert.equal(material.date, '2029-01-03')
+  assert.equal(material.random_string, 'abcdefghijklmnopqrstuvwxyzABCDEFGH')
+  assert.equal(material.random_number, 7)
+})
+
+// 回归：官网 2026-10 把三个键名都藏进了字符串表、数组加载时还要先转 12 档。
+// 旧实现靠「枚举所有旋转找第一条当天记录」猜，结果会拿错档——日期对上、token 却是别的日期的，
+// 接口回「签名Token已失效」。这里要求必须由自检表达式定出唯一旋转，且换档就取不到。
+check('字符串表被旋转过时只认自检表达式定出的那一档，不许拼出跨日期的错配', () => {
+  const solved = extractSigningMaterial(signingBundle, '2029-01-01')
+  assert.equal(solved.random_number, 4, '第一组用的是转表后的 random_number')
+  // 同样的日期字面量 + 另一个键值组合：只有转对表才凑得齐
+  const other = extractSigningMaterial(signingBundle, '2029-01-03')
+  assert.equal(other.random_number, 7)
+  assert.notEqual(solved.random_number, other.random_number)
+
+  // 自检目标被改动（等于官网换了一档）时，应当找不到配置而不是退回乱猜
+  const tampered = signingBundle.replace('})(Seeds,-1687);', '})(Seeds,999999);')
+  assert.throws(() => extractSigningMaterial(tampered, '2029-01-01'), /没有 2029-01-01 的配置/)
+  // 数组长度不足以转满 12 档时同样解不出，不许给出半个结果
+  const short = signingBundle.replace(
+    '["date","abcdefghijklmnopqrstuvwxyzABCDEFGH","random_number","2029-01-03","2029-01-02","2029-01-05","24","36","48","60","noise2","noise3","noise","random_string","2029-01-01"]',
+    '["noise","random_string","random_number"]',
+  )
+  assert.throws(() => extractSigningMaterial(short, '2029-01-01'), /没有 2029-01-01 的配置/)
+})
+
+// 回归：官网 2026-10 把 RSA 公钥搬进了字符串表内部（反引号模板字符串），
+// 旧实现用 JSON.parse 解表，整张表直接被跳过；公钥也不再是配置块的右边界。
+// 下面这份包把公钥放进数组、配置分居数组函数前后，正是官网现在的排布。
+const TOKEN = 'abcdefghijklmnopqrstuvwxyzABCDEFGH'
+const templateBundle = [
+  'function decode(t,e){return t=t-0,Seeds()[t]}',
+  'const T=decode;',
+  '(function(t,e){const n=decode,r=t();for(;;)try{if(parseInt(n(5))/1+parseInt(n(6))/2===e)break;r.push(r.shift())}catch(s){r.push(r.shift())}})(Seeds,5255);',
+  'const before={};before[T(0)]=T(1),before[T(2)]=T(3),before[T(4)]=5;',
+  'function Seeds(){const t=["random_number","4242","2026-02-02",`' + pem + '`,"date","2026-02-01","random_string","' + TOKEN + '"];return Seeds=function(){return t},Seeds()}',
+  'const after={};after[T(0)]=T(6),after[T(2)]=T(3),after[T(4)]=9;',
+  'const rows=[before,after];',
+].join('\n')
+// 官网另一张表用的是自替换形态的解码器，旋转写成 while(!![]){try{...}} 而不是 for(;;)try{...
+const selfReplaceBundle = [
+  'function Seeds(){const t=["random_number","4242","2026-03-02","' + TOKEN + '","date","2026-03-01","random_string"];return Seeds=function(){return t},Seeds()}',
+  'function decode(t,e){const n=Seeds();return decode=function(t,e){return t=t-0,n[t]},decode(t,e)}',
+  '(function(t,e){const n=decode,r=t();while(!![]){try{if(parseInt(n(4))/1+parseInt(n(5))/2===e)break;r.push(r.shift())}catch(s){r.push(r.shift())}})(Seeds,5255);',
+  'const T=decode;',
+  'const row={};row[T(0)]=T(1),row[T(2)]=T(6),row[T(3)]=11;',
+  'const key=`' + pem + '`;',
+].join('\n')
+// 反例：字符串表里出现模板插值就不是常量表，宁可整张作废也不能猜
+const interpolatedBundle = [
+  'function decode(t,e){return t=t-0,Seeds()[t]}',
+  'const T=decode;',
+  '(function(t,e){const n=decode,r=t();for(;;)try{if(parseInt(n(2))/1===e)break;r.push(r.shift())}catch(s){r.push(r.shift())}})(Seeds,2026);',
+  'function Seeds(){const t=["date",`${1 + 1}`,"2026-04-01","random_string","' + TOKEN + '","random_number"];return Seeds=function(){return t},Seeds()}',
+  'const row={};row[T(0)]=T(2),row[T(3)]=T(4),row[T(5)]=4;',
+  'const key=`' + pem + '`;',
+].join('\n')
+
+check('字符串表混有模板字符串、且配置块分居数组函数前后时照样解析', () => {
+  const earlier = extractSigningMaterial(templateBundle, '2026-02-01')
+  assert.equal(earlier.random_string, TOKEN)
+  assert.equal(earlier.random_number, 5)
+  // 数组函数之后的配置也要取得到：早先拿公钥当右边界，这里会被整段截掉
+  const later = extractSigningMaterial(templateBundle, '2026-02-02')
+  assert.equal(later.date, '2026-02-02')
+  assert.equal(later.random_number, 9)
+  assert.equal(later.publicKey, pem)
+})
+
+check('解码器是自替换形态、数组旋转写成 while(!![]) 时照样解析', () => {
+  const material = extractSigningMaterial(selfReplaceBundle, '2026-03-01')
+  assert.equal(material.random_string, TOKEN)
+  assert.equal(material.random_number, 11)
+  assert.equal(material.publicKey, pem)
+})
+
+check('字符串表里有模板插值就整张表作废，不许猜出配置', () => {
+  assert.throws(() => extractSigningMaterial(interpolatedBundle, '2026-04-01'), /没有 2026-04-01 的配置/)
+})
+
+check('接口签名、上海日期和 Nuxt 脚本发现均受严格约束', () => {
+  const material = extractSigningMaterial(signingBundle, '2029-01-01')
+  const signed = createSignedParams(XINJIANG_CHANNEL_ENDPOINT, '1861920000000', material, {
+    now, random: () => 0.123456789,
+  })
+  assert.match(signed.guid, /^[a-z0-9]+-[a-z0-9]+$/)
+  assert.equal(signed.guid[8], '-')
+  assert.equal(signed.hash, `000${signed.hash.slice(3)}`)
+  assert.equal(signed.hash, createHash('sha256')
+    .update(`${signed.ts}${signed.x}`).digest('hex'))
+  assert.match(signed.sign, /^[a-f0-9]{32}[A-Za-z0-9+/]+=*$/)
+  assert.equal(shanghaiDate(Date.parse('2028-12-31T16:01:00Z')), '2029-01-01')
+  assert.deepEqual(scriptUrls(
+    '<script src="/_nuxt/live_A-1.js"></script><script src="https://evil.test/_nuxt/no.js"></script><script src="/plain.js"></script>',
+    XINJIANG_PAGE,
+  ), ['https://www.xjtvs.com.cn/_nuxt/live_A-1.js'])
+})
+
+check('random_number ≥ 15 时 md5 用第 8 位换成 y 的 guid 变体，工作量证明随 ts 固定', () => {
+  const material = { random_string: 'abcdefghijklmnopqrstuvwxyzABCDEFGH', random_number: 20, publicKey: pem }
+  const stamp = '1861920000000'
+  const signed = createSignedParams(XINJIANG_CHANNEL_ENDPOINT, stamp, material, {
+    now, random: () => 0.123456789, powTs: 1861920000123,
+  })
+  const md5 = text => createHash('md5').update(text, 'ascii').digest('hex')
+  const token = 'abcdefghijklmnopqrstuvwxyzABCDEFGH'.replace('u', '')
+  const signGuid = `${signed.guid.slice(0, 8)}y${signed.guid.slice(9)}`
+  const endpoint = XINJIANG_CHANNEL_ENDPOINT.slice(1)
+  assert.equal(signed.sign.slice(0, 32), md5(`${token}${signGuid}${stamp}${endpoint}`))
+  assert.notEqual(signed.sign.slice(0, 32), md5(`${token}${signed.guid}${stamp}${endpoint}`))
+  assert.equal(signed.ts, 1861920000123)
+  assert.match(signed.hash, /^000[a-f0-9]{61}$/)
+  assert.equal(signed.hash, createHash('sha256').update(`${signed.ts}${signed.x}`).digest('hex'))
+  assert.equal(createSignedParams(XINJIANG_CHANNEL_ENDPOINT, stamp, material, {
+    now, random: () => 0.5, powTs: 1861920000123,
+  }).x, signed.x)
+})
+
+check('频道接口逐路校验：标禁播、缺席或台号对不上的只跳过那一路，一路都没有才报错', () => {
+  const parsed = parseChannelList(apiPayload(), { now })
+  assert.equal(parsed.urls.size, 7)
+  assert.match(parsed.urls.get('1'), /xjtv1stream\.m3u8/)
+  assert.match(parsed.urls.get('16'), /xjtv4stream\.m3u8/)
+  const forbidden = apiPayload()
+  Object.assign(forbidden.data.find(item => String(item.Id) === '16'), { IsForbidden: true, PlayStreamUrl: null })
+  const partial = parseChannelList(forbidden, { now })
+  assert.equal(partial.urls.size, 6)
+  assert.equal(partial.urls.has('16'), false, '重新标禁播的一路不连累其余六路')
+  assert.deepEqual([...partial.forbidden], ['16'], '按节目禁播的记下来，播放时单独说明')
+  assert.equal(parsed.forbidden.size, 0)
+  const incomplete = apiPayload()
+  incomplete.data = incomplete.data.filter(item => String(item.Id) !== '23')
+  assert.equal(parseChannelList(incomplete, { now }).urls.has('23'), false)
+  const swapped = apiPayload()
+  swapped.data.find(item => String(item.Id) === '3').SimpleName = 'XJTV-3'
+  assert.equal(parseChannelList(swapped, { now }).urls.has('3'), false, '台号对不上的不认')
+  assert.throws(() => parseChannelList({ success: true, data: [] }, { now }), /没有返回任何可播放频道/)
+  assert.throws(() => parseChannelList('{broken', { now }), /有效 JSON/)
+})
+
+check('媒体白名单覆盖签名清单和分片并拒绝外部地址', () => {
+  const channel = CHANNELS[0]
+  const stream = `https://slstplay.xjtvs.com.cn${channel.path}?auth_key=${authFor(1)}&aliyun_uuid=${uuid}`
+  const segment = `https://slstplay.xjtvs.com.cn/xjtv1/segment.ts?auth_key=${authFor(2)}`
+  assert.equal(officialHlsUrl(stream, channel, now).url, stream)
+  assert.equal(officialAssetUrl(segment), segment)
+  assert.deepEqual(upstreamHeadersFor(segment), {
+    Origin: 'https://www.xjtvs.com.cn',
+    Referer: XINJIANG_PAGE,
+  })
+  assert.equal(validateHls(`#EXTM3U\n#EXTINF:6,\n${segment}\n`, stream).startsWith('#EXTM3U'), true)
+  for (const bad of [
+    `http://slstplay.xjtvs.com.cn/xjtv1/a.ts?auth_key=${authFor(1)}`,
+    `https://slstplay.xjtvs.com.cn.evil.test/xjtv1/a.ts?auth_key=${authFor(1)}`,
+    `https://user:pass@slstplay.xjtvs.com.cn/xjtv1/a.ts?auth_key=${authFor(1)}`,
+    `https://slstplay.xjtvs.com.cn/private/a.ts?auth_key=${authFor(1)}`,
+    'https://slstplay.xjtvs.com.cn/xjtv1/a.ts',
+  ]) assert.throws(() => officialAssetUrl(bad))
+  assert.throws(() => validateHls('#EXTM3U\nhttps://evil.test/a.ts\n', stream))
+})
+
+await checkAsync('首次播放完成签名发现，各路共享短效入口缓存但每次刷新清单', async () => {
+  let pageRequests = 0
+  let scriptRequests = 0
+  let timestampRequests = 0
+  let channelRequests = 0
+  let manifestRequests = 0
+  const fetchImpl = async raw => {
+    const url = new URL(raw)
+    if (url.href === XINJIANG_PAGE) {
+      pageRequests++
+      return response('<script src="/_nuxt/live_A-1.js"></script>')
+    }
+    if (url.href === 'https://www.xjtvs.com.cn/_nuxt/live_A-1.js') {
+      scriptRequests++
+      return response(signingBundle)
+    }
+    if (url.href === XINJIANG_TIMESTAMP_URL) {
+      timestampRequests++
+      return response({ success: true, data: '1861920000000' })
+    }
+    if (url.origin === 'https://slstapi.xjtvs.com.cn' && url.pathname === XINJIANG_CHANNEL_ENDPOINT) {
+      channelRequests++
+      assert.equal(url.searchParams.get('type'), '1')
+      assert.equal(url.searchParams.get('json'), 'true')
+      assert.equal(url.searchParams.get('stamp'), '1861920000000')
+      assert.match(url.searchParams.get('sign') || '', /^[a-f0-9]{32}[A-Za-z0-9+/]+=*$/)
+      assert.match(url.searchParams.get('hash') || '', /^000[a-f0-9]{61}$/)
+      assert.equal(url.searchParams.get('hash'), createHash('sha256')
+        .update(`${url.searchParams.get('ts')}${url.searchParams.get('x')}`).digest('hex'))
+      return response(apiPayload())
+    }
+    if (url.hostname === 'slstplay.xjtvs.com.cn') {
+      manifestRequests++
+      const directory = url.pathname.slice(0, url.pathname.lastIndexOf('/') + 1)
+      return response(`#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:${manifestRequests}\n#EXTINF:6,\n${directory.slice(1)}segment.ts?auth_key=${authFor(manifestRequests + 10)}\n`)
+    }
+    throw new Error(`unexpected URL: ${url.href}`)
+  }
+  const resolver = createResolver({ fetchImpl })
+  const satellite = await resolver.resolve('xjtv-1', { now, random: () => 0.25 })
+  const kids = await resolver.resolve('xjtv-8', { now: now + 1000, random: () => 0.25 })
+  assert.equal(pageRequests, 1)
+  assert.equal(scriptRequests, 1)
+  assert.equal(timestampRequests, 1)
+  assert.equal(channelRequests, 1)
+  assert.equal(manifestRequests, 2)
+  assert.match(satellite.manifestText, /MEDIA-SEQUENCE:1/)
+  assert.match(kids.manifestText, /MEDIA-SEQUENCE:2/)
+  assert.equal(satellite.relayHls, true)
+  assert.equal(satellite.upstreamUrlTransform(
+    `https://slstplay.xjtvs.com.cn/xjtv1/a.ts?auth_key=${authFor(99)}`,
+  ).includes('/xjtv1/a.ts'), true)
+})
+
+await checkAsync('清缓存后会重新发现官网当天脚本和短效入口', async () => {
+  let pageRequests = 0
+  const fetchImpl = async raw => {
+    const url = new URL(raw)
+    if (url.href === XINJIANG_PAGE) {
+      pageRequests++
+      return response('<script src="/_nuxt/live_A-1.js"></script>')
+    }
+    if (url.pathname === '/_nuxt/live_A-1.js') return response(signingBundle)
+    if (url.href === XINJIANG_TIMESTAMP_URL) return response({ data: '1861920000000' })
+    if (url.pathname === XINJIANG_CHANNEL_ENDPOINT) return response(apiPayload())
+    if (url.hostname === 'slstplay.xjtvs.com.cn') {
+      return response(`#EXTM3U\n#EXTINF:6,\nsegment.ts?auth_key=${authFor(7)}\n`)
+    }
+    throw new Error(`unexpected URL: ${url.href}`)
+  }
+  const resolver = createResolver({ fetchImpl })
+  assert.notEqual((await resolver.resolve('xjtv-1', { now })).url, '')
+  resolver.clear()
+  assert.notEqual((await resolver.resolve('xjtv-1', { now })).url, '')
+  assert.equal(pageRequests, 2)
+})
+
+await checkAsync('当前节目被标禁播时说明是这档节目限播，不说不在直播列表', async () => {
+  const payload = apiPayload()
+  Object.assign(payload.data.find(item => String(item.Id) === '17'), { IsForbidden: true, PlayStreamUrl: null })
+  payload.data = payload.data.filter(item => String(item.Id) !== '23')
+  const fetchImpl = async raw => {
+    const url = new URL(raw)
+    if (url.href === XINJIANG_PAGE) return response('<script src="/_nuxt/live_A-1.js"></script>')
+    if (url.pathname === '/_nuxt/live_A-1.js') return response(signingBundle)
+    if (url.href === XINJIANG_TIMESTAMP_URL) return response({ data: '1861920000000' })
+    if (url.pathname === XINJIANG_CHANNEL_ENDPOINT) return response(payload)
+    if (url.hostname === 'slstplay.xjtvs.com.cn') return response(`#EXTM3U\n#EXTINF:6,\nsegment.ts?auth_key=${authFor(7)}\n`)
+    throw new Error(`unexpected URL: ${url.href}`)
+  }
+  const resolver = createResolver({ fetchImpl })
+  const blocked = await resolver.resolve('xjtv-5', { now })
+  assert.equal(blocked.url, '')
+  assert.match(blocked.desc, /维吾尔语影视 当前这档节目官网不提供网络直播，换档后自动恢复/)
+  const missing = await resolver.resolve('xjtv-8', { now })
+  assert.match(missing.desc, /新疆少儿 当前不在官网有效直播列表中/)
+  assert.notEqual((await resolver.resolve('xjtv-4', { now })).url, '')
+})
+
+console.log(`\n全部通过：${passed}/15 ✅`)

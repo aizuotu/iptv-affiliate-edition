@@ -1,0 +1,4547 @@
+#!/usr/bin/env node
+/**
+ * 抓取模块注册表 + 哔哩哔哩直播模块 测试。
+ *
+ * 覆盖的不变量：
+ *  - 注册表：id 白名单、sourceId 命名空间（它会写进 EXTINF 属性，是注入面）；
+ *  - 配置校验：类型/边界/默认值；secret 字段空串=保持原值（否则后台每次保存
+ *    都会把用户看不见的凭据抹掉），显式 null 才是清空；
+ *  - secret 不回传明文（默认部署下后台是无鉴权的）；
+ *  - 环境变量兜底（docker 用户没有别的路子注入凭据）；
+ *  - 选流偏好：HLS 优先、AVC 优先，以及地址必须是裸字符串拼接——一旦过
+ *    new URL() 就会丢掉 extra 里那段 expires token，地址直接失效；
+ *  - 抓取失败时沿用上一轮频道，不让频道静默从播放列表消失；
+ *  - 模块默认开启，明确关闭后必须挡住抓取与输出。
+ *
+ * 运行： node scripts/test-extractors.mjs   （或 npm test）
+ */
+import assert from 'node:assert/strict'
+import { constants, createCipheriv, createDecipheriv, createHash, createHmac, generateKeyPairSync, privateEncrypt } from 'node:crypto'
+import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync, readdirSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { Readable } from 'node:stream'
+
+import { listModules, getModule, sourceIdOf, resolverFor, validateModule, proxyModules, moduleRegion, REGION_NAMES, MODULE_ID_RE, MODULE_CATEGORIES } from '../extractors/registry.js'
+import { domainSuffix, hostCoveredBy } from '../utils/outboundProxy.js'
+import { secretHint } from '../utils/secretHint.js'
+import { proxyHostsOf } from '../extractors/overseas/index.js'
+import { clearUrlCache, channel as playbackChannel } from '../utils/appUtils.js'
+import { qualityFrom } from '../utils/qualityOverride.js'
+import {
+  selectFromPlayurl, parseRoomList, normalizeRoom, mapLimit, selectTopRooms, RoomError, BILIBILI_GROUP, DEFAULT_MIN_ONLINE,
+  fetchRoom as fetchBiliRoom,
+  resolveRoom as resolveBiliRoom,
+  claimsRef as biliClaimsRef,
+  clearResolveCache as clearBiliResolveCache,
+  checkLogin as checkBiliLogin,
+  SESSDATA_REJECTED_NOTICE,
+} from '../extractors/bilibili-live/api.js'
+import { shouldFailRound, parseAreaNames, mergeRoomRefs, groupBilibiliResults } from '../extractors/bilibili-live/index.js'
+import {
+  DEFAULT_MIN_HEAT,
+  HUYA_GROUP,
+  clearResolveCache as clearHuyaResolveCache,
+  normalizeRoom as normalizeHuyaRoom,
+  parseCategoryRooms as parseHuyaCategoryRooms,
+  parseEventRooms as parseHuyaEventRooms,
+  parseRoomList as parseHuyaRoomList,
+  parseRoomPage as parseHuyaRoomPage,
+  resolveRoom as resolveHuyaRoom,
+  selectBitrate as selectHuyaBitrate,
+  signHlsUrl as signHuyaHlsUrl,
+  lastSegmentUrl as huyaLastSegmentUrl,
+  orderLines as orderHuyaLines,
+} from '../extractors/huya-live/api.js'
+import { mergeRooms as mergeHuyaRooms, parseAreaNames as parseHuyaAreaNames } from '../extractors/huya-live/index.js'
+import {
+  ANONYMOUS_DID,
+  DEFAULT_MIN_HEAT as DEFAULT_DOUYU_MIN_HEAT,
+  DOUYU_GROUP,
+  clearResolveCache as clearDouyuResolveCache,
+  createMobileSign as createDouyuMobileSign,
+  isOfficialStreamUrl as isOfficialDouyuStreamUrl,
+  normalizeCategoryPayload as normalizeDouyuCategoryPayload,
+  normalizeRoom as normalizeDouyuRoom,
+  parseMobileRoomPage as parseDouyuMobileRoomPage,
+  parseRoomList as parseDouyuRoomList,
+  resolveRoom as resolveDouyuRoom,
+} from '../extractors/douyu-live/api.js'
+import { mergeRooms as mergeDouyuRooms, parseAreaNames as parseDouyuAreaNames } from '../extractors/douyu-live/index.js'
+import {
+  buildChannelGroups as buildGxtvGroups,
+  clearStreamCache as clearGxtvStreamCache,
+  resolveChannel as resolveGxtvChannel,
+  streamUrlOf,
+} from '../extractors/gxtv/api.js'
+import {
+  buildProvinceGroup,
+  buildChannelGroups as buildFjtvGroups,
+  clearProvinceCache,
+  clearXiamenCache,
+  fetchFuzhouChannels,
+  fetchXiamenChannels,
+  FUZHOU_CHANNELS,
+  hlsOf as fjtvHlsOf,
+  PROVINCE_CHANNELS,
+  resolveProvinceChannel,
+  resolveXiamenChannel,
+  XIAMEN_CHANNELS,
+} from '../extractors/fjtv/api.js'
+import { mergeFuzhouChannels, mergeXiamenChannels } from '../extractors/fjtv/index.js'
+import {
+  buildChannels as buildCztvChannels,
+  clearPlayInfoCache as clearCztvPlayInfoCache,
+  resolveChannel as resolveCztvChannel,
+  selectStream as selectCztvStream,
+  signStreamUrl as signCztvStreamUrl,
+} from '../extractors/cztv/api.js'
+import {
+  buildAuthRequest as buildJstvAuthRequest,
+  buildChannels as buildJstvChannels,
+  clearCache as clearJstvCache,
+  resolveChannel as resolveJstvChannel,
+  signStreamUrl as signJstvStreamUrl,
+} from '../extractors/jstv/api.js'
+import {
+  buildExchangeRequest as buildIqiluExchangeRequest,
+  clearCache as clearIqiluCache,
+  decryptExchangeResponse as decryptIqiluExchangeResponse,
+  parseChannelPage as parseIqiluChannelPage,
+  resolveChannel as resolveIqiluChannel,
+} from '../extractors/iqilu/api.js'
+import {
+  CHANNEL_LIST_TIMEOUT_MS as HNNTV_LIST_TIMEOUT_MS,
+  buildChannels as buildHnntvChannels,
+  clearCache as clearHnntvCache,
+  resolveChannel as resolveHnntvChannel,
+} from '../extractors/hnntv/api.js'
+import {
+  buildChannels as buildHntvChannels,
+  buildSignedHeaders as buildHntvSignedHeaders,
+  clearCache as clearHntvCache,
+  resolveChannel as resolveHntvChannel,
+} from '../extractors/hntv/api.js'
+import {
+  buildChannels as buildHebtvChannels,
+  clearCache as clearHebtvCache,
+  normalizeRows as normalizeHebtvRows,
+  normalizeScenicArticles as normalizeHebtvScenicArticles,
+  normalizeScenicDetail as normalizeHebtvScenicDetail,
+  resolveChannel as resolveHebtvChannel,
+  signStreamUrl as signHebtvStreamUrl,
+} from '../extractors/hebtv/api.js'
+import {
+  buildChannels as buildKankanewsChannels,
+  buildScenicChannels as buildKankanewsScenicChannels,
+  buildSignedHeaders as buildKankanewsSignedHeaders,
+  clearCache as clearKankanewsCache,
+  decryptLiveAddress as decryptKankanewsLiveAddress,
+  resolveChannel as resolveKankanewsChannel,
+} from '../extractors/kankanews/api.js'
+import {
+  buildChannels as buildMgtvChannels,
+  buildSourceRequest as buildMgtvSourceRequest,
+  clearCache as clearMgtvCache,
+  resolveChannel as resolveMgtvChannel,
+  selectHighestSource as selectMgtvSource,
+} from '../extractors/mgtv/api.js'
+import {
+  buildCatalogAuth as buildSztvCatalogAuth,
+  buildChannels as buildSztvChannels,
+  buildLiveKeyRequest as buildSztvLiveKeyRequest,
+  clearCache as clearSztvCache,
+  decodeLiveKey as decodeSztvLiveKey,
+  resolveChannel as resolveSztvChannel,
+  signStreamUrl as signSztvStreamUrl,
+} from '../extractors/sztv/api.js'
+import { shouldFailRound as miguShouldFailRound } from '../extractors/migu/index.js'
+import {
+  ExtractorManager, validateConfig, redactConfig, resolveConfig, normalizeGroups, emptyHealth,
+} from '../utils/extractorManager.js'
+// 只用它的纯校验与「校验不过就提前返回」那条路：上面咪咕模块的 import 早已把
+// systemConfigAPI → updateData → channelMerger 整条链拉进来，这里不多带任何副作用
+import { contentFlagChanges, setExtractorsEnabledAPI } from '../utils/extractorsAPI.js'
+
+let passed = 0
+const check = (name, fn) => { fn(); passed++; console.log(`  ✅ ${name}`) }
+
+const checkAsync = async (name, fn) => { await fn(); passed++; console.log(`  ✅ ${name}`) }
+
+console.log('抓取模块注册表测试')
+
+const bili = getModule('bilibili-live')
+const huya = getModule('huya-live')
+const douyu = getModule('douyu-live')
+
+// ---- 注册表 ----
+
+check('注册表枚举出模块，且每个 id 都过白名单', () => {
+  const modules = listModules()
+  assert.ok(modules.length >= 1)
+  for (const module of modules) {
+    assert.ok(MODULE_ID_RE.test(module.id), `${module.id} 不合法`)
+    assert.equal(typeof module.fetch, 'function')
+  }
+})
+
+check('sourceId 用 xt: 命名空间，与外部源 ext: / 内置源 bi: 不撞', () => {
+  assert.equal(sourceIdOf('bilibili-live'), 'xt:bilibili-live')
+  // app.js 的 sourceId 白名单正则要求这个形状
+  assert.ok(/^xt:[\w.-]{1,64}$/.test(sourceIdOf('bilibili-live')))
+})
+
+check('虎牙模块已注册，且只认自己的单段播放引用', () => {
+  assert.equal(huya?.id, 'huya-live')
+  assert.equal(resolverFor('huya-660101')?.id, 'huya-live')
+  assert.equal(resolverFor('huya-lpl')?.id, 'huya-live')
+  assert.equal(resolverFor('huya-660101/extra'), null)
+})
+
+check('斗鱼模块已注册，且只认自己的数字播放引用', () => {
+  assert.equal(douyu?.id, 'douyu-live')
+  assert.equal(resolverFor('douyu-9999')?.id, 'douyu-live')
+  assert.equal(resolverFor('douyu-room')?.id, undefined)
+  assert.equal(resolverFor('douyu-9999/extra'), null)
+})
+
+check('id 白名单挡住会破坏 EXTINF 属性的字符', () => {
+  for (const bad of ['A-Upper', '带中文', 'has space', 'quote"inside', '-leading', '']) {
+    assert.equal(MODULE_ID_RE.test(bad), false, `${bad} 不该通过`)
+  }
+})
+
+// ---- 配置校验 ----
+
+check('int 字段：边界外拒绝并回退，不落坏值', () => {
+  const bad = validateConfig(bili, { topPerArea: 999 }, { topPerArea: 8 })
+  assert.equal(bad.ok, false)
+  assert.equal(bad.config.topPerArea, 8, '越界时保持原值')
+  assert.match(bad.errors[0].message, /不能大于/)
+
+  const good = validateConfig(bili, { topPerArea: '5' }, {})
+  assert.equal(good.ok, true)
+  assert.equal(good.config.topPerArea, 5, '字符串数字要被转成数字')
+})
+
+check('职责分离：validateConfig 只产出要落盘的，默认值由 resolveConfig 补', () => {
+  // 未提交的字段：已存的保留，没存过的不写（稀疏）
+  assert.equal(validateConfig(bili, {}, { topPerArea: 12 }).config.topPerArea, 12)
+  assert.deepEqual(validateConfig(bili, {}, {}).config, {}, '空提交 + 空存储 = 什么都不落盘')
+
+  // 默认值在取值层，不在存储层
+  const effective = resolveConfig(bili, {})
+  assert.equal(effective.topPerArea, 8)
+  assert.equal(effective.preferAvc, true)
+  assert.equal(resolveConfig(bili, { topPerArea: 12 }).topPerArea, 12, '已存值压过默认')
+})
+
+check('secret 字段：空串 = 保持原值（后台看不见它，不能因保存而抹掉）', () => {
+  const { config } = validateConfig(bili, { sessdata: '' }, { sessdata: 'SECRET' })
+  assert.equal(config.sessdata, 'SECRET')
+})
+
+check('secret 字段：显式 null 才是清空，且清空后回落到 env', () => {
+  // 稀疏存储下「清空」= 键不存在，而不是存一个空串。语义相同，但表达方式让
+  // resolveConfig 能正确回落到 env / 默认——存空串是做不到的。
+  const { config } = validateConfig(bili, { sessdata: null }, { sessdata: 'SECRET' })
+  assert.equal('sessdata' in config, false)
+
+  const saved = process.env.mbiliSessdata
+  try {
+    process.env.mbiliSessdata = 'FROM_ENV'
+    assert.equal(resolveConfig(bili, config).sessdata, 'FROM_ENV', '清空后该由 env 接手')
+  } finally {
+    if (saved === undefined) delete process.env.mbiliSessdata
+    else process.env.mbiliSessdata = saved
+  }
+})
+
+check('未知字段被丢弃，不会混进配置', () => {
+  const { config } = validateConfig(bili, { 一个不存在的字段: 'x', rooms: '13' }, {})
+  assert.equal('一个不存在的字段' in config, false)
+  assert.equal(config.rooms, '13')
+})
+
+check('redactConfig 不回传 secret 明文，只回传有没有值', () => {
+  const { config, secretsSet } = redactConfig(bili, { sessdata: 'SECRET', rooms: '13' })
+  assert.equal(config.sessdata, '', '绝不能把凭据回传给前端')
+  assert.equal(secretsSet.sessdata, true)
+  assert.equal(config.rooms, '13', '非 secret 字段照常回传')
+
+  const empty = redactConfig(bili, { sessdata: '' })
+  assert.equal(empty.secretsSet.sessdata, false)
+  assert.deepEqual(empty.secretHints, {}, '没设的不给结尾')
+})
+
+check('凭据只回结尾几位：长的 4 位、中等 2 位、短的不露', () => {
+  assert.equal(redactConfig(bili, { sessdata: 'abcdefghijkl%2Cwxyz' }).secretHints.sessdata, 'wxyz')
+  assert.equal(redactConfig(bili, { sessdata: 'SECRET' }).secretHints.sessdata, '', '短凭据露几位就猜得出来')
+  assert.equal(secretHint('12345678'), '78')
+  assert.equal(secretHint('0123456789abcdef'), 'cdef')
+  assert.equal(secretHint('SESSDATA=0123456789abcdef; \n'), 'cdef', 'Cookie 结尾的分号和空白不算')
+  assert.equal(secretHint(null), '')
+})
+
+check('取值分层：已存 → 环境变量 → schema 默认', () => {
+  const key = 'mbiliSessdata'
+  const saved = process.env[key]
+  try {
+    process.env[key] = 'FROM_ENV'
+    assert.equal(resolveConfig(bili, {}).sessdata, 'FROM_ENV', '没配过 → 用 env')
+    assert.equal(resolveConfig(bili, { sessdata: 'FROM_UI' }).sessdata, 'FROM_UI', '配过 → 已存值优先')
+    delete process.env[key]
+    assert.equal(resolveConfig(bili, {}).sessdata, '', '都没有 → schema 默认')
+  } finally {
+    if (saved === undefined) delete process.env[key]
+    else process.env[key] = saved
+  }
+})
+
+check('稀疏存储：显式设成 false 的布尔字段能压过 env（原先做不到）', () => {
+  // 原实现存的是补齐默认值后的全量 key，default:true 的布尔恒为真值 → 直接跳过 env，
+  // env 永远读不到；而 default:false 的会被赋成字符串 "false"（真值），
+  // 「显式关掉」反而变成「强制打开」。稀疏存储让「没配过」成为明确状态才解开这一条。
+  const schema = [{ key: 'flag', type: 'boolean', env: 'mTestFlag', default: true, label: '开关' }]
+  const mod = { id: 'probe', configSchema: schema }
+  const saved = process.env.mTestFlag
+  try {
+    process.env.mTestFlag = 'false'
+    assert.equal(resolveConfig(mod, {}).flag, false, '没配过 → env 说关就关')
+    assert.equal(resolveConfig(mod, { flag: true }).flag, true, '配过 true → 压过 env')
+    process.env.mTestFlag = 'true'
+    assert.equal(resolveConfig(mod, { flag: false }).flag, false, '配过 false → 同样压过 env')
+  } finally {
+    if (saved === undefined) delete process.env.mTestFlag
+    else process.env.mTestFlag = saved
+  }
+})
+
+check('稀疏存储：只落盘用户显式设过的字段', () => {
+  const { config } = validateConfig(bili, { rooms: '13' }, {})
+  assert.deepEqual(Object.keys(config), ['rooms'], '没提交的字段不该被补进存储')
+  const again = validateConfig(bili, { preferAvc: false }, config)
+  assert.deepEqual(Object.keys(again.config).sort(), ['preferAvc', 'rooms'], '已存的保留，新提交的加入')
+  assert.equal(again.config.preferAvc, false, 'false 也算「配过」')
+})
+
+check('清空 = 回到「没配过」，而不是存一个空值', () => {
+  const stored = { rooms: '13', sessdata: 'SECRET' }
+  const cleared = validateConfig(bili, { rooms: '' }, stored)
+  assert.equal('rooms' in cleared.config, false, '文本清空后不该留在存储里')
+  assert.equal(cleared.config.sessdata, 'SECRET', '没提交的 secret 保持不变')
+  const wiped = validateConfig(bili, { sessdata: null }, stored)
+  assert.equal('sessdata' in wiped.config, false, 'secret 显式 null 才清空')
+})
+
+check('保存别的字段不会顺手把 secret 写成空串（稀疏存储的直接收益）', () => {
+  // 原先 validateConfig 对每个 key 都建自有属性，存过一次配置后磁盘上全是自有属性，
+  // 于是「用户配过没有」无从判断，env 兜底也就没法按 key 存在与否来做。
+  const { config } = validateConfig(bili, { rooms: '13' }, {})
+  assert.equal('sessdata' in config, false, '没提交的 secret 不该被补成空串落盘')
+})
+
+check('select 字段：只接受 options 里的值，且保留声明的原始类型', () => {
+  const mod = { id: 'probe', configSchema: [{
+    key: 'rate', type: 'select', label: '画质',
+    options: [{ value: 3, label: '高清' }, { value: 9, label: '4K' }], default: 3,
+  }] }
+  assert.equal(validateConfig(mod, { rate: '9' }, {}).config.rate, 9, '下拉提交的字符串要还原成数字')
+  const bad = validateConfig(mod, { rate: '5' }, {})
+  assert.equal(bad.ok, false)
+  assert.match(bad.errors[0].message, /不是可选值/)
+})
+
+check('multiselect 字段：兼容换行字符串，只接受 options 且至少选一项', () => {
+  const mod = { id: 'probe', configSchema: [{
+    key: 'areas', type: 'multiselect', label: '分区',
+    options: [{ value: '赛事' }, { value: '知识' }, { value: '生活' }],
+  }] }
+  assert.equal(validateConfig(mod, { areas: '赛事\n知识\n赛事' }, {}).config.areas, '赛事\n知识', '应去重并保持提交顺序')
+  assert.equal(validateConfig(mod, { areas: ['生活', '赛事'] }, {}).config.areas, '生活\n赛事', '也兼容数组输入')
+  assert.equal(validateConfig(mod, { areas: '' }, {}).ok, false, '不能保存空选择')
+  assert.equal(validateConfig(mod, { areas: '赛事\n不存在' }, {}).ok, false, '不能保存无效选项')
+  const bad = validateConfig(mod, { areas: '' }, { areas: '知识' })
+  assert.equal(bad.config.areas, '知识', '校验失败时保留原配置')
+})
+
+check('select / multiselect 没有 options 会在启动期被拒绝', () => {
+  const withField = (field) => ({ id: 'probe', name: 'probe', fetch: async () => ({}), configSchema: [field] })
+  assert.throws(() => validateModule(withField({ key: 'x', type: 'select', label: 'x' })), /没有 options/)
+  assert.throws(() => validateModule(withField({ key: 'x', type: 'multiselect', label: 'x' })), /没有 options/)
+  validateModule(withField({ key: 'x', type: 'select', label: 'x', options: [{ value: 1, label: 'a' }] }))
+  validateModule(withField({ key: 'x', type: 'multiselect', label: 'x', options: [{ value: 1, label: 'a' }] }))
+})
+
+check('本机媒体路由声明必须成对，避免认领后没有响应处理器', () => {
+  const base = { id: 'probe', name: 'probe', fetch: async () => ({ groups: [] }) }
+  assert.throws(() => validateModule({ ...base, claimsLocalPath: () => true }), /必须成对实现/)
+  assert.throws(() => validateModule({ ...base, handleLocalRequest: async () => ({}) }), /必须成对实现/)
+  validateModule({ ...base, claimsLocalPath: () => true, handleLocalRequest: async () => ({ status: 200 }) })
+})
+
+check('频道表缓存版本只接受正整数，避免每次启动都误判过期', () => {
+  const base = { id: 'probe', name: 'probe', fetch: async () => ({ groups: [] }) }
+  assert.throws(() => validateModule({ ...base, catalogVersion: 0 }), /正整数/)
+  assert.throws(() => validateModule({ ...base, catalogVersion: '2' }), /正整数/)
+  validateModule({ ...base, catalogVersion: 2 })
+})
+
+check('relay 全代理兼容声明只接受布尔值', () => {
+  const base = { id: 'probe', name: 'probe', fetch: async () => ({ groups: [] }) }
+  assert.throws(() => validateModule({ ...base, relayProxyCompatible: 'yes' }), /必须是布尔值/)
+  validateModule({ ...base, relayProxyCompatible: true })
+  validateModule({ ...base, relayProxyCompatible: false })
+})
+
+check('市县台声明（county）：只接受布尔值，声明了就得默认关、不带分类', () => {
+  const base = { id: 'probe', name: 'probe', fetch: async () => ({ groups: [] }) }
+  assert.throws(() => validateModule({ ...base, county: 'yes', defaultEnabled: false }), /county 必须是布尔值/)
+  assert.throws(() => validateModule({ ...base, county: true }), /defaultEnabled: false/)
+  assert.throws(() => validateModule({ ...base, county: true, defaultEnabled: false, category: 'live' }), /不带 category/)
+  validateModule({ ...base, county: true, defaultEnabled: false })
+  validateModule({ ...base, county: false })
+})
+
+check('市县台模块两头对齐：声明了 county 的归省面板；默认关、归省面板的免账号模块都声明了 county', () => {
+  const county = listModules().filter(module => module.county)
+  assert.ok(county.length >= 21, `市县台模块应有山东市县 + 20 个「市县台·省」，实际 ${county.length}`)
+  for (const module of county) {
+    assert.ok(REGION_NAMES.has(moduleRegion(module)), `${module.id} 声明了 county，但面板「${moduleRegion(module)}」不是省级地区`)
+  }
+  // 新加的市县模块按 ADD-CHANNELS.md 默认关、进本省面板；忘了写 county 会漏出后台「批量开关」的「市县台」一节
+  const missing = listModules()
+    .filter(module => !module.county && (module.category || 'standard') === 'standard'
+      && module.defaultEnabled === false && REGION_NAMES.has(moduleRegion(module)))
+    .map(module => module.id)
+  assert.deepEqual(missing, [], '默认关、归省面板的免账号模块要声明 county: true（不是市县台的话，改这条检查并写明原因）')
+})
+
+check('normalizeGroups 挡住畸形返回，不让一个坏模块搞崩整轮合并', () => {
+  assert.deepEqual(normalizeGroups(null), [])
+  assert.deepEqual(normalizeGroups('nope'), [])
+  assert.deepEqual(normalizeGroups([{ name: '', dataList: [] }]), [])
+  assert.deepEqual(normalizeGroups([{ name: 'A', dataList: 'nope' }]), [])
+  assert.deepEqual(
+    normalizeGroups([{ name: 'A', dataList: [{ name: 'x' }, null, 'bad'] }]),
+    [{ name: 'A', dataList: [{ name: 'x' }] }],
+  )
+})
+
+// ---- 选流 ----
+
+const playurl = (streams) => ({ playurl_info: { playurl: { stream: streams } } })
+const codecOf = (name, base, host, extra) => ({
+  codec_name: name, base_url: base, current_qn: 10000,
+  url_info: [{ host, extra }],
+})
+
+check('选流：HLS 优先于 FLV，即便 FLV 排在前面', () => {
+  const data = playurl([
+    { protocol_name: 'http_stream', format: [{ codec: [codecOf('avc', '/flv', 'https://f', '?t=1')] }] },
+    { protocol_name: 'http_hls', format: [{ codec: [codecOf('avc', '/hls', 'https://h', '?t=2')] }] },
+  ])
+  assert.equal(selectFromPlayurl(data, { preferHls: true }).url, 'https://h/hls?t=2')
+  assert.equal(selectFromPlayurl(data, { preferHls: false }).url, 'https://f/flv?t=1')
+})
+
+check('选流：AVC 优先于 HEVC（老盒子解不了 HEVC），可反转', () => {
+  const data = playurl([
+    { protocol_name: 'http_hls', format: [{ codec: [
+      codecOf('hevc', '/h265', 'https://a', ''),
+      codecOf('avc', '/h264', 'https://a', ''),
+    ] }] },
+  ])
+  assert.equal(selectFromPlayurl(data, {}).url, 'https://a/h264')
+  assert.equal(selectFromPlayurl(data, { preferAvc: false }).url, 'https://a/h265')
+})
+
+check('选流：关掉优先 H.264 时，HEVC 档位比 AVC 低就仍选 AVC', () => {
+  // 10-19 登录实测 594063：avc 给原画真彩 25000，hevc 只给蓝光 400
+  const data = playurl([
+    { protocol_name: 'http_hls', format: [{ codec: [
+      { ...codecOf('avc', '/h264', 'https://a', ''), current_qn: 25000 },
+      { ...codecOf('hevc', '/h265', 'https://a', ''), current_qn: 400 },
+    ] }] },
+  ])
+  const picked = selectFromPlayurl(data, { preferAvc: false })
+  assert.equal(picked.url, 'https://a/h264')
+  assert.equal(picked.qn, 25000)
+})
+
+check('选流：地址是裸字符串拼接，expires token 原样保留', () => {
+  const extra = '?expires=1787000000&len=0&oi=123&pt=web&sign=abc&trid=xyz'
+  const data = playurl([
+    { protocol_name: 'http_hls', format: [{ codec: [
+      codecOf('avc', '/live-bvc/1/live_1_2.m3u8', 'https://cn-gotcha104.bilivideo.com', extra),
+    ] }] },
+  ])
+  const { url, qn } = selectFromPlayurl(data, {})
+  assert.equal(url, `https://cn-gotcha104.bilivideo.com/live-bvc/1/live_1_2.m3u8${extra}`)
+  assert.ok(url.includes('sign=abc'), '签名不能在拼接中丢失')
+  assert.equal(qn, 10000)
+})
+
+check('选流：没有 stream 时报「未开播或地区限制」而不是崩', () => {
+  assert.throws(() => selectFromPlayurl(playurl([]), {}), RoomError)
+  assert.throws(() => selectFromPlayurl({}, {}), RoomError)
+})
+
+check('选流：有 stream 但没有可用 host/base 时报明确错误', () => {
+  const data = playurl([{ protocol_name: 'http_hls', format: [{ codec: [
+    { codec_name: 'avc', base_url: '', url_info: [{ host: '', extra: '' }] },
+  ] }] }])
+  assert.throws(() => selectFromPlayurl(data, {}), /没有可用的 host/)
+})
+
+// ---- 播放时解析（issue #120：签名地址实测 60 分钟过期，不能再写进播放列表）----
+
+/** 三个 B 站接口的假回包；path → 整个 JSON 信封。fetchImpl 记下每次请求的路径与请求头。 */
+const biliApiFixture = (overrides = {}) => {
+  const calls = []
+  const payloads = {
+    '/room/v1/Room/get_info': { code: 0, data: { room_id: 21144080, uid: 7, title: 'KPL 总决赛', live_status: 1 } },
+    '/xlive/web-room/v2/index/getRoomPlayInfo': { code: 0, data: playurl([
+      { protocol_name: 'http_hls', format: [{ codec: [{
+        ...codecOf('avc', '/live-bvc/1/live_21144080.m3u8', 'https://d1--cn-gotcha104.bilivideo.com', '?expires=1788749800&sign=abc'),
+        current_qn: 250,
+      }] }] },
+    ]) },
+    '/live_user/v1/Master/info': { code: 0, data: { info: { uname: '哔哩哔哩赛事', face: 'https://i0.hdslb.com/face.jpg' } } },
+    ...overrides,
+  }
+  const fetchImpl = async (url, init) => {
+    const path = new URL(String(url)).pathname
+    calls.push({ path, headers: init?.headers || {} })
+    const payload = payloads[path]
+    if (!payload) throw new Error(`unexpected ${path}`)
+    return { ok: true, status: 200, json: async () => payload }
+  }
+  return { fetchImpl, calls }
+}
+
+check('B 站：已改为延迟解析模块，ref 单段且只认自己的', () => {
+  assert.equal(bili.capabilities.resolve, true)
+  assert.equal(typeof bili.resolve, 'function')
+  assert.equal(resolverFor('bili-21144080')?.id, 'bilibili-live')
+  assert.equal(resolverFor('bili-21144080/extra'), null, 'ref 必须是单个路径段')
+  assert.equal(biliClaimsRef('huya-660101'), false)
+  assert.equal(biliClaimsRef('bili-'), false)
+  assert.equal(bili.configSchema.some(f => f.key === 'preferHls' || f.key === 'cachingMs'), false, '直链时代的选项已下线')
+  assert.ok(bili.minRefreshMinutes <= 45 && bili.maxRefreshMinutes >= 45, '老用户存的 45 分钟不能越界回落')
+})
+
+await checkAsync('B 站：抓取只落 deferredRef + relayHls，不再把一小时就过期的直链和请求头写进播放列表', async () => {
+  const { fetchImpl, calls } = biliApiFixture()
+  const { channel, roomId } = await fetchBiliRoom('21144080', { cookie: 'SESSDATA=abc', fetchImpl })
+  assert.equal(roomId, '21144080')
+  assert.equal(channel.deferredRef, 'bili-21144080')
+  assert.equal(channel.relayHls, true)
+  assert.equal(channel.url, undefined, '直链不进缓存与播放列表')
+  assert.equal(channel.opts, undefined, 'LunaTV 导入时 EXTINF 后必须紧跟地址')
+  assert.equal(channel.name, '[超清] 哔哩哔哩赛事 · KPL 总决赛', '画质档仍写进频道名（判断 SESSDATA 是否生效的信号）')
+  assert.equal(channel.logo, 'https://i0.hdslb.com/face.jpg')
+  assert.ok(calls.every(c => c.headers.Cookie === 'SESSDATA=abc'), '登录态随每个接口请求发出')
+})
+
+await checkAsync('B 站：播放时才换取签名地址并要求清单中继，60 秒内复用、失败短暂记忆', async () => {
+  clearBiliResolveCache()
+  const { fetchImpl, calls } = biliApiFixture()
+  const config = { sessdata: 'abc', preferAvc: true }
+  const t0 = 1700000000000
+  const first = await resolveBiliRoom('bili-21144080', { now: t0, config, fetchImpl })
+  assert.equal(first.url, 'https://d1--cn-gotcha104.bilivideo.com/live-bvc/1/live_21144080.m3u8?expires=1788749800&sign=abc')
+  assert.equal(first.relayHls, true)
+  assert.equal(first.upstreamHeaders.Referer, 'https://live.bilibili.com/')
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].path, '/xlive/web-room/v2/index/getRoomPlayInfo', '播放时只打一次取流接口')
+  assert.equal(calls[0].headers.Cookie, 'SESSDATA=abc')
+
+  const again = await resolveBiliRoom('bili-21144080', { now: t0 + 30 * 1000, config, fetchImpl })
+  assert.equal(again, first, '60 秒内复用同一份')
+  assert.equal(calls.length, 1)
+
+  await resolveBiliRoom('bili-21144080', { now: t0 + 61 * 1000, config, fetchImpl })
+  assert.equal(calls.length, 2, '过了 60 秒重新换取')
+
+  // 登录态 / 编码偏好不同要分开缓存：匿名请求不能拿到登录态换来的地址
+  await resolveBiliRoom('bili-21144080', { now: t0 + 61 * 1000, config: { preferAvc: true }, fetchImpl })
+  assert.equal(calls.length, 3)
+  assert.equal(calls[2].headers.Cookie, undefined)
+
+  const bad = await resolveBiliRoom('bili-x', { now: t0, config, fetchImpl })
+  assert.equal(bad.url, '')
+  assert.match(bad.desc, /格式错误/)
+
+  clearBiliResolveCache()
+  const offline = biliApiFixture({ '/xlive/web-room/v2/index/getRoomPlayInfo': { code: 0, data: playurl([]) } })
+  const missing = await resolveBiliRoom('bili-21144080', { now: t0, config, fetchImpl: offline.fetchImpl })
+  assert.equal(missing.url, '')
+  assert.match(missing.desc, /未开播或地区限制/)
+  await resolveBiliRoom('bili-21144080', { now: t0 + 5 * 1000, config, fetchImpl: offline.fetchImpl })
+  assert.equal(offline.calls.length, 1, '失败 15 秒内不再打接口，挡住播放器的连环重试')
+  await resolveBiliRoom('bili-21144080', { now: t0 + 16 * 1000, config, fetchImpl: offline.fetchImpl })
+  assert.equal(offline.calls.length, 2, '15 秒后重试')
+
+  clearBiliResolveCache()
+  const risk = biliApiFixture({ '/xlive/web-room/v2/index/getRoomPlayInfo': { code: -352, message: '风控校验失败' } })
+  const blocked = await resolveBiliRoom('bili-21144080', { now: t0, config, fetchImpl: risk.fetchImpl })
+  assert.equal(blocked.url, '')
+  assert.match(blocked.desc, /-352/)
+  await resolveBiliRoom('bili-21144080', { now: t0 + 30 * 1000, config, fetchImpl: risk.fetchImpl })
+  assert.equal(risk.calls.length, 1, '风控期间 60 秒内不再撞接口')
+  clearBiliResolveCache()
+})
+
+// ---- 房间清单解析 ----
+
+check('房间清单：注释行、行尾注释、空行都被正确处理', () => {
+  assert.deepEqual(parseRoomList([
+    '# 整行注释',
+    '',
+    '13   # 这是备注',
+    '  1022  ',
+  ].join('\n')), ['13', '1022'])
+})
+
+check('房间清单：URL 的 fragment 不被当成注释截断', () => {
+  // Python 版无条件按 # 切，会把带 fragment 的地址截坏
+  assert.deepEqual(
+    parseRoomList('https://live.bilibili.com/13?spm=1#anchor'),
+    ['https://live.bilibili.com/13?spm=1#anchor'],
+  )
+})
+
+check('房间清单：URL 后跟注释按空白切，地址完整保留', () => {
+  assert.deepEqual(
+    parseRoomList('https://live.bilibili.com/13?a=1   # TI 主舞台'),
+    ['https://live.bilibili.com/13?a=1'],
+  )
+})
+
+await checkAsync('房间号归一：纯数字 / 路径数字 / h5 路径，都不联网', async () => {
+  assert.equal(await normalizeRoom('13'), '13')
+  assert.equal(await normalizeRoom('https://live.bilibili.com/1022?live_from=86001'), '1022')
+  assert.equal(await normalizeRoom('https://live.bilibili.com/h5/1022'), '1022')
+})
+
+await checkAsync('房间号归一：全角数字被归一，不再变成一个必然失败的请求', async () => {
+  assert.equal(await normalizeRoom('１３'), '13')
+})
+
+await checkAsync('房间号归一：认不出的输入报错而不是静默丢弃', async () => {
+  await assert.rejects(() => normalizeRoom('随便写点什么'), RoomError)
+  await assert.rejects(() => normalizeRoom(''), RoomError)
+})
+
+await checkAsync('mapLimit：保持顺序，且并发不超过上限', async () => {
+  let running = 0
+  let peak = 0
+  const out = await mapLimit([1, 2, 3, 4, 5, 6], 2, async (n) => {
+    running++
+    peak = Math.max(peak, running)
+    await new Promise(r => setTimeout(r, 5))
+    running--
+    return n * 2
+  })
+  assert.deepEqual(out, [2, 4, 6, 8, 10, 12], '结果必须按输入顺序')
+  assert.ok(peak <= 2, `并发峰值 ${peak} 超过上限`)
+})
+
+check('全网失败判失败、全体没开播判成功——决定要不要清空用户的频道', () => {
+  // 两者都产出 0 个频道。断网时若被记成「成功抓到 0 个」，上一轮缓存会被空结果
+  // 覆盖，用户的频道消失且不退避重试。
+  assert.equal(shouldFailRound(0, 3), true, '一间在播的都没有且有真错误 → 判失败，保留上一轮缓存')
+  assert.equal(shouldFailRound(0, 0), false, '全部没开播 → 正常结果，如实写出')
+  assert.equal(shouldFailRound(2, 5), false, '有在播的就不算整轮失败，失败的那几间进 skipped')
+})
+
+check('播放路由：裸数字归咪咕，认不出的 ref 无人认领', () => {
+  // ⚠️ 「裸数字 → 咪咕」这条兜底不能去掉：体育赛事在 updateData 里直接写
+  // ${replace}/<pID> 追加进播放列表，完全绕开 extractorManager；老订阅里缓存的
+  // 历史地址同理。改成「只认 fetch() 产出过的 ref」会让这些地址全部 404。
+  assert.equal(resolverFor('608807420')?.id, 'migu')
+  assert.equal(resolverFor('abc'), null)
+})
+
+check('浙江延迟引用使用命名空间，不与咪咕裸数字路由冲突', () => {
+  assert.equal(resolverFor('cztv-108')?.id, 'cztv')
+  assert.equal(resolverFor('108')?.id, 'migu')
+  assert.equal(resolverFor('cztv-108/extra'), null, 'ref 必须保持单个路径段')
+})
+
+check('claimsRef 保持 isNaN 语义，不许收紧成 /^\\d+$/', () => {
+  // 现网 isNaN("") / isNaN("1e3") / isNaN("0x10") 都是 false，都会被放行走到
+  // 咪咕接口。收紧会改掉「地址格式错误」的边界——那是可观察行为变更。
+  const migu = getModule('migu')
+  for (const pass of ['608807420', '', '1e3', '0x10', 'Infinity', ' 12 ']) {
+    assert.equal(migu.claimsRef(pass), true, `${JSON.stringify(pass)} 应当被放行（与收编前一致）`)
+  }
+  for (const reject of ['abc', '12a', '中文']) {
+    assert.equal(migu.claimsRef(reject), false, `${JSON.stringify(reject)} 应当被拒`)
+  }
+})
+
+check('声明了 resolve 能力的模块必须实现 resolve 与 claimsRef', () => {
+  for (const module of listModules()) {
+    if (!module.capabilities?.resolve) continue
+    assert.equal(typeof module.resolve, 'function', `${module.id} 缺 resolve`)
+    assert.equal(typeof module.claimsRef, 'function', `${module.id} 缺 claimsRef`)
+  }
+})
+
+check('clearUrlCache 会委托到各模块的 clearResolveCache', () => {
+  // 画质/编码改动后不清缓存，三小时内会继续下发旧编码的流（issue #60）。
+  // 调用点在 systemConfigAPI 与 configBackupAPI，改名要同步两处。
+  let called = 0
+  const migu = getModule('migu')
+  const original = migu.clearResolveCache
+  migu.clearResolveCache = () => { called++ }
+  try { clearUrlCache() } finally { migu.clearResolveCache = original }
+  assert.equal(called, 1)
+})
+
+check('咪咕已收编成模块，且三条 wire format 保持不变', () => {
+  const migu = getModule('migu')
+  assert.ok(migu, '咪咕应当在注册表里')
+  assert.equal(migu.sourceId, 'migu', 'source-ids 必须保持字面量，老用户「按档禁用源」存的就是它')
+  assert.equal(typeof migu.enabledGetter, 'function', '开关要代理到 config.js 的 enableMigu')
+  assert.equal(migu.capabilities.cache, 'memory', '175 个频道带全部原始字段，不该落盘')
+})
+
+check('第一阶段两个官方直播模块已注册，缓存/解析能力声明正确', () => {
+  const gxtv = getModule('gxtv')
+  const cztv = getModule('cztv')
+  assert.ok(gxtv)
+  assert.ok(cztv)
+  assert.equal(gxtv.capabilities.cache, 'disk')
+  assert.equal(gxtv.capabilities.resolve, true)
+  assert.equal(gxtv.defaultRefreshMinutes, 30, '广西密钥要短周期主动刷新，不能沿用频道列表的长缓存')
+  assert.equal(gxtv.refreshConfigurable, false, '广西刷新策略由模块管理，不该让用户误改')
+  assert.deepEqual(gxtv.configSchema, [], '广西频道范围使用固定策略，不向用户暴露选择项')
+  assert.equal(cztv.capabilities.cache, 'disk')
+  assert.equal(cztv.capabilities.resolve, true)
+  assert.equal(cztv.refreshConfigurable, false, '浙江的签名和 CDN 探测不是外层刷新输入框能控制的')
+  assert.deepEqual(cztv.configSchema, [], '浙江不向用户暴露播放缓冲等技术参数')
+})
+
+check('福建模块仍是原 id，地市固定六小时刷新且省级、厦门短效地址可延迟解析', () => {
+  const fjtv = getModule('fjtv')
+  assert.ok(fjtv)
+  assert.equal(fjtv.capabilities.cache, 'disk')
+  assert.equal(fjtv.capabilities.resolve, true)
+  assert.equal(fjtv.defaultRefreshMinutes, 360)
+  assert.equal(fjtv.refreshConfigurable, false)
+  assert.deepEqual(fjtv.configSchema, [])
+  assert.equal(resolverFor('fjtv-province-665248990102917120')?.id, 'fjtv')
+  assert.equal(resolverFor('fjtv-xiamen-16')?.id, 'fjtv')
+})
+
+check('江苏网络台模块已注册，使用固定频道周期和播放时解析', () => {
+  const jstv = getModule('jstv')
+  assert.ok(jstv)
+  assert.equal(jstv.capabilities.cache, 'disk')
+  assert.equal(jstv.capabilities.resolve, true)
+  assert.equal(jstv.defaultRefreshMinutes, 240)
+  assert.equal(jstv.refreshConfigurable, false)
+  assert.deepEqual(jstv.configSchema, [], '江苏不向用户暴露播放缓冲等技术参数')
+  assert.equal(resolverFor('jstv-670')?.id, 'jstv')
+})
+
+check('山东齐鲁网模块已注册，使用固定频道周期且不需要全代理', () => {
+  const iqilu = getModule('iqilu')
+  assert.ok(iqilu)
+  assert.equal(iqilu.capabilities.cache, 'disk')
+  assert.equal(iqilu.capabilities.resolve, true)
+  assert.equal(iqilu.defaultRefreshMinutes, 240)
+  assert.equal(iqilu.refreshConfigurable, false)
+  assert.deepEqual(iqilu.configSchema, [])
+  assert.equal(resolverFor('iqilu-sdtv')?.id, 'iqilu')
+})
+
+check('河南大象新闻模块已注册，使用固定两小时刷新且排除购物频道', () => {
+  const hntv = getModule('hntv')
+  assert.ok(hntv)
+  assert.equal(hntv.capabilities.cache, 'disk')
+  assert.equal(hntv.capabilities.resolve, true)
+  assert.equal(hntv.defaultRefreshMinutes, 120)
+  assert.equal(hntv.refreshConfigurable, false)
+  assert.deepEqual(hntv.configSchema, [])
+  assert.equal(resolverFor('hntv-145')?.id, 'hntv')
+})
+
+check('海南网台模块已注册，频道定时同步且播放时解析签名地址', () => {
+  const hnntv = getModule('hnntv')
+  assert.ok(hnntv)
+  assert.equal(hnntv.capabilities.cache, 'disk')
+  assert.equal(hnntv.capabilities.resolve, true)
+  assert.equal(hnntv.defaultRefreshMinutes, 240)
+  assert.equal(hnntv.refreshConfigurable, false)
+  assert.deepEqual(hnntv.configSchema, [])
+  assert.equal(resolverFor('hnntv-13')?.id, 'hnntv')
+  assert.equal(resolverFor('hnntv-13/extra'), null)
+})
+
+check('河北冀时模块已注册，完整频道表定时同步且播放时续签', () => {
+  const hebtv = getModule('hebtv')
+  assert.ok(hebtv)
+  assert.equal(hebtv.capabilities.cache, 'disk')
+  assert.equal(hebtv.capabilities.resolve, true)
+  assert.equal(hebtv.defaultRefreshMinutes, 240)
+  assert.equal(hebtv.refreshConfigurable, false)
+  assert.deepEqual(hebtv.configSchema, [])
+  assert.equal(resolverFor('hebtv-10524916')?.id, 'hebtv')
+  assert.equal(resolverFor('hebtv-10524916/extra'), null)
+})
+
+check('深圳广电模块已注册，固定周期刷新且逐路径签名流必须全代理', () => {
+  const sztv = getModule('sztv')
+  assert.ok(sztv)
+  assert.equal(sztv.capabilities.cache, 'disk')
+  assert.equal(sztv.capabilities.resolve, true)
+  assert.equal(sztv.defaultRefreshMinutes, 240)
+  assert.equal(sztv.refreshConfigurable, false)
+  assert.deepEqual(sztv.configSchema, [])
+  assert.equal(resolverFor('sztv-24725')?.id, 'sztv')
+  assert.equal(resolverFor('sztv-R77mK1v'), null)
+})
+
+check('省市广电模块卡片只显示地区名，不带平台品牌', () => {
+  const expectedNames = {
+    'gdsport-events': '广东体育赛事', 'sichuan-cities': '四川市州',
+    anhui: '安徽', liaoning: '辽宁', chongqing: '重庆', sichuan: '四川', chengdu: '成都', cztv: '浙江', dalian: '大连', fjtv: '福建', gansu: '甘肃', gdtv: '广东', gxtv: '广西',
+    gztv: '广州', hbtv: '湖北', hebtv: '河北', heilongjiang: '黑龙江', hnntv: '海南', hntv: '河南',
+    iqilu: '山东', hangzhou: '杭州', ningbo: '宁波', jiaxing: '嘉兴', taizhou: '台州', shaoxing: '绍兴', 'zhejiang-local': '浙江地方台', jlntv: '吉林', jstv: '江苏', jxntv: '江西', kankanews: '上海', 'meizhou-hakka': '梅州', mgtv: '湖南', njtv: '南京', nmtv: '内蒙古',
+    'quanzhou-minnan': '泉州', 'quanzhou-county': '晋江、石狮', putian: '莆田', ningde: '宁德', wuxi: '无锡', yangzhou: '扬州', nantong: '南通', yancheng: '盐城',
+    ningxia: '宁夏', qinghai: '青海', qingdao: '青岛', qtv: '青岛景观', shaanxi: '陕西', shanxi: '山西', sztv: '深圳', tianjin: '天津',
+    xinjiang: '新疆', xizang: '西藏', yunnan: '云南', tdm: '澳门',
+    // 从省台模块拆出来的景观卡片（2026-11-08），卡名与分组同名
+    'jlntv-scenic': '吉林风景', 'hebtv-scenic': '河北景观', 'njtv-scenic': '南京景观', 'kankanews-scenic': '上海景观', 'beijing-scenic': '北京景观',
+  }
+  const groupOverrides = { 'sichuan-cities': '四川', chengdu: '四川', 'gdsport-events': '广东', dalian: '辽宁', gztv: '广东', sztv: '广东', hangzhou: '浙江', ningbo: '浙江', jiaxing: '浙江', taizhou: '浙江', shaoxing: '浙江', 'zhejiang-local': '浙江', 'meizhou-hakka': '广东', 'quanzhou-minnan': '福建', 'quanzhou-county': '福建', putian: '福建', ningde: '福建', wuxi: '江苏', yangzhou: '江苏', nantong: '江苏', yancheng: '江苏', njtv: '江苏', qingdao: '山东', qtv: '山东', 'jlntv-scenic': '吉林', 'hebtv-scenic': '河北', 'njtv-scenic': '江苏', 'kankanews-scenic': '上海', 'beijing-scenic': '北京' }
+  for (const [id, name] of Object.entries(expectedNames)) {
+    assert.equal(getModule(id)?.name, name, `${id} 卡片标题应只保留地区名`)
+    assert.equal(
+      getModule(id)?.outputGroupName,
+      groupOverrides[id] || name,
+      `${id} 播放列表分组应按地区归类`,
+    )
+  }
+})
+
+check('芒果 TV 模块已注册，固定刷新策略且不暴露技术设置', () => {
+  const mgtv = getModule('mgtv')
+  assert.ok(mgtv)
+  assert.equal(mgtv.capabilities.cache, 'disk')
+  assert.equal(mgtv.capabilities.resolve, true)
+  assert.equal(mgtv.defaultRefreshMinutes, 240)
+  assert.equal(mgtv.refreshConfigurable, false)
+  assert.deepEqual(mgtv.configSchema, [])
+  assert.equal(resolverFor('mgtv-287')?.id, 'mgtv')
+})
+
+
+// ---- 管理器 ----
+
+const tmp = mkdtempSync(join(tmpdir(), 'iptv-extractors-test-'))
+// 每个用例一份独立的配置/缓存文件：共用一份的话，前一个用例存下的开关状态
+// 会污染后一个（比如前一个用例关掉的模块开关会被后一个读到）
+let caseSeq = 0
+const newManager = (legacy, extractorConfig, extractorCache) => {
+  const seq = ++caseSeq
+  const manager = new ExtractorManager()
+  manager.configPath = join(tmp, `extractors-${seq}.json`)
+  manager.cachePath = join(tmp, `extractor-cache-${seq}.json`)
+  // 指向测试自己的旧配置，避免读到仓库根目录里用户的真实 system-config.json
+  manager.legacyConfigPath = join(tmp, `system-config-${seq}.json`)
+  if (extractorConfig !== undefined) writeFileSync(manager.configPath, JSON.stringify(extractorConfig))
+  if (extractorCache !== undefined) writeFileSync(manager.cachePath, JSON.stringify(extractorCache))
+  if (legacy !== undefined) writeFileSync(manager.legacyConfigPath, JSON.stringify(legacy))
+  return manager.load()
+}
+const seed = (manager, groups, health = {}) => {
+  manager.cache.modules['bilibili-live'] = {
+    groups,
+    health: { status: 'ok', lastSuccessAt: Date.now(), consecutiveFailures: 0, ...health },
+  }
+}
+const oneGroup = [{
+  name: '赛事', dataList: [{ name: '[原画] 主播', url: 'https://cdn/a.m3u8', opts: ['http-referrer=https://live.bilibili.com/'] }],
+}]
+
+try {
+  check('迁移：把系统配置里真有的画质搬进模块，幂等，且不覆盖已配过的', () => {
+    // enableHDR 是 hidden 字段，env 压过已存值；shell 里带着 compose 的 menableHDR=true 跑测试
+    // 会把这里的断言打翻，所以先摘掉
+    const savedHDR = process.env.menableHDR
+    delete process.env.menableHDR
+    const manager = newManager({ rateType: 9, enableHDR: false, enableH265: false, port: '1905' })
+    const cfg = manager.effectiveConfig(getModule('migu'))
+    if (savedHDR !== undefined) process.env.menableHDR = savedHDR
+    assert.equal(cfg.rateType, 9)
+    assert.equal(cfg.enableHDR, false)
+    assert.equal(cfg.enableH265, false)
+    assert.equal(manager.config.migrated?.migu, true, '要打迁移标记')
+    // 只搬 legacySystemConfigKeys 声明的键，port 是全局配置不该被卷进来
+    assert.equal('port' in manager.config.modules.migu.config, false)
+
+    // 幂等：把值改掉并落盘，再 load 一次，迁移不该把它冲回 9
+    // （注意要先落盘——load() 会重新读磁盘，只改内存的话是被重读覆盖，测不到迁移）
+    manager.updateModuleConfig('migu', { rateType: 4 })
+    manager.load()
+    assert.equal(manager.effectiveConfig(getModule('migu')).rateType, 4, '标记在就不该再搬')
+  })
+
+  check('★ 隐藏字段 env 压过已存值：迁移搬来的 enableHDR:true 不能顶死 menableHDR=false（#117）', () => {
+    // 老「系统配置」页每次保存都无条件写 enableHDR:true，迁移把它搬成模块「已存值」；
+    // enableHDR 在后台是 hidden 的，用户只剩 README 写的 menableHDR=false 这一条路，
+    // 若已存值仍优先，用户关 HDR 就毫无反应，也没有任何界面能改回来。
+    const manager = newManager({ enableHDR: true, rateType: 9 })
+    const migu = getModule('migu')
+    assert.equal(manager.config.modules.migu.config.enableHDR, true, '前提：值确实被搬成了已存值')
+    const saved = { hdr: process.env.menableHDR, rate: process.env.mrateType }
+    try {
+      process.env.menableHDR = 'false'
+      process.env.mrateType = '4'
+      const cfg = manager.effectiveConfig(migu)
+      assert.equal(cfg.enableHDR, false, '隐藏字段：env 必须生效')
+      assert.equal(cfg.rateType, 9, '可见字段不受影响：已存值仍压过 env（后台改过的不能被 compose 悄悄改掉）')
+      process.env.menableHDR = ''
+      assert.equal(manager.effectiveConfig(migu).enableHDR, true, 'env 为空串视为没设，回到已存值')
+      delete process.env.menableHDR
+      assert.equal(manager.effectiveConfig(migu).enableHDR, true, 'env 没设回到已存值')
+      // 反向同样成立：文件里 false、compose 示例的 menableHDR=true 也压过去
+      manager.updateModuleConfig('migu', { enableHDR: false })
+      process.env.menableHDR = 'true'
+      assert.equal(manager.effectiveConfig(migu).enableHDR, true, '反向也是 env 优先')
+      // 后台状态里要标出它来自 env（隐藏字段不渲染，但 API 载荷得自洽）
+      const state = manager.getState().modules.find(m => m.id === 'migu')
+      assert.equal(state.envProvided.enableHDR, 'menableHDR')
+    } finally {
+      for (const [env, v] of [['menableHDR', saved.hdr], ['mrateType', saved.rate]]) {
+        if (v === undefined) delete process.env[env]
+        else process.env[env] = v
+      }
+    }
+  })
+
+  check('迁移：凭据不写进日志（docker 日志常被贴进 issue）', () => {
+    const lines = []
+    const orig = console.log
+    console.log = (...a) => lines.push(a.join(' '))
+    try {
+      newManager({ userId: '12345678', token: 'SECRET_TOKEN_VALUE', rateType: 4 })
+    } finally { console.log = orig }
+    const all = lines.join('\n')
+    assert.ok(all.includes('迁入模块'), '应当有迁移日志')
+    assert.equal(all.includes('SECRET_TOKEN_VALUE'), false, 'token 明文不该出现在日志里')
+    assert.ok(all.includes('token=<已迁移>'), '应当只报「已迁移」')
+    assert.ok(all.includes('12345678'), 'userId 不是 secret，照常打出来便于排查')
+  })
+
+  check('迁移：系统配置里没有的键一个都不写，env 继续 live 生效', () => {
+    // 这是关键——搬过来等于把 mrateType=4 固化成文件值，用户改 compose 就再也不生效。
+    const manager = newManager({ port: '1905' })   // 完全没有画质字段
+    assert.deepEqual(manager.config.modules.migu?.config ?? {}, {}, '不该凭空写入')
+    const saved = process.env.mrateType
+    try {
+      process.env.mrateType = '4'
+      assert.equal(manager.effectiveConfig(getModule('migu')).rateType, 4, 'env 仍然生效')
+    } finally {
+      if (saved === undefined) delete process.env.mrateType
+      else process.env.mrateType = saved
+    }
+  })
+
+  check('迁移：旧配置文件损坏时不打标记，下次启动重试', () => {
+    const manager = new ExtractorManager()
+    const seq = ++caseSeq
+    manager.configPath = join(tmp, `extractors-bad-${seq}.json`)
+    manager.cachePath = join(tmp, `extractor-cache-bad-${seq}.json`)
+    manager.legacyConfigPath = join(tmp, `system-config-bad-${seq}.json`)
+    writeFileSync(manager.legacyConfigPath, '{ 这不是合法 JSON')
+    manager.load()
+    assert.equal(manager.config.migrated?.migu, undefined, '读失败绝不能当成「迁过了」')
+  })
+
+  check('★ 迁移：旧文件里没有咪咕键时不打标记——之后导入 v3 备份还能迁到（搬家场景）', () => {
+    // 回归：首启对空 legacy 也打标记的话，全新部署 v4 再在后台导入 v3 备份
+    // （system-config.json 里带着账号）时，reload() 会因标记直接跳过迁移，
+    // 导入的 VIP 账号成死数据、画质静默降档到游客档。
+    const manager = newManager({ port: '1905' })   // 全新安装：没有任何咪咕键
+    assert.equal(manager.config.migrated?.migu, undefined, '空 legacy 不该焊死标记')
+    writeFileSync(manager.legacyConfigPath, JSON.stringify({ userId: 'u1', token: 't1', rateType: 4 }))
+    manager.reload()   // configBackupAPI 导入配置后走的就是这条
+    assert.equal(manager.effectiveConfig(getModule('migu')).rateType, 4, '导入的配置要被搬进模块')
+    assert.equal(manager.config.migrated?.migu, true, '这回真搬了，标记照打')
+  })
+
+  check('★ 只有声明了 loginFlow 的模块支持扫码登录', () => {
+    // API 层是通用的、不认识任何平台：靠模块声明 loginFlow 决定支不支持。
+    // 咪咕的 SESSDATA 等价物是 cookie 里读得到的，不需要扫码；将来要加，
+    // 声明同样的 start/poll/configKey 即可，不用动 extractorsAPI。
+    const bili = getModule('bilibili-live')
+    assert.equal(typeof bili.loginFlow?.start, 'function')
+    assert.equal(typeof bili.loginFlow?.poll, 'function')
+    assert.equal(bili.loginFlow?.configKey, 'sessdata', '登录成功后凭据写进哪个字段')
+    assert.equal(getModule('migu').loginFlow, undefined, '没声明就是不支持，API 层据此拒绝')
+  })
+
+  check('模块声明的 helper / helperSection 要透传给后台，否则辅助 UI 渲染不出来', () => {
+    const manager = newManager()
+    const modules = manager.getState().modules
+    const migu = modules.find(m => m.id === 'migu')
+    const bili = modules.find(m => m.id === 'bilibili-live')
+    const sichuan = modules.find(m => m.id === 'sichuan')
+    const ysp = modules.find(m => m.id === 'yangshipin')
+    assert.equal(migu.helper, 'migu-bookmarklet')
+    assert.equal(migu.helperSection, '', '没声明 helperSection 的渲染在表单最上面（咪咕就是）')
+    assert.equal(bili.helper, 'bilibili-login', 'B 站的扫码登录助手')
+    assert.equal(bili.helperSection, '登录态（选填）', '助手要挂在它自己那一段，不是表单最上面')
+    assert.equal(sichuan.helper, 'sichuan-token', '四川模块应提供官网登录态提取助手')
+    assert.equal(sichuan.helperSection, '四川官网登录', '四川助手应和 Token 输入框位于同一段')
+    assert.equal(ysp.helper, 'yangshipin-login', '央视频模块应提供持久浏览器登录助手')
+    assert.equal(typeof getModule('yangshipin').browserLoginFlow?.start, 'function')
+  })
+
+  check('★ 卡片「占上行」按写盘路由数：/proxy/ 与 FLV 算转发，/relay/、直链不算；没抓过的只看模块级声明', () => {
+    const ok = { status: 'ok', lastSuccessAt: Date.now(), consecutiveFailures: 0 }
+    const manager = newManager(undefined, {
+      enabled: true,
+      modules: {
+        'bestv-fj': { config: { networkMode: 'ipv6' }, enabled: true },
+        'douyin-live': { config: { format: 'hls' }, enabled: true },
+      },
+      masterSwitchRetired: true,
+    }, {
+      modules: {
+        // 频道自己声明：厦门台全转发、其余只转清单
+        fjtv: { groups: [{ name: '福建', dataList: [
+          { name: '厦视一套', deferredRef: 'fjtv-xiamen-16', proxyHls: true },
+          { name: '福建综合', deferredRef: 'fjtv-province-665248990102917120', relayHls: true },
+          { name: '东南卫视', deferredRef: 'fjtv-province-665248966136664064', relayHls: true },
+        ] }], health: ok },
+        // 平台声明 proxy，但直链频道（没有 deferredRef）照样由播放器直连
+        jlntv: { groups: [{ name: '吉林', dataList: [
+          { name: '吉林卫视', deferredRef: 'jlntv-satellite' },
+          { name: '吉林直链', url: 'https://example.com/a.m3u8' },
+        ] }], health: ok },
+        // 直链模块：一个都不转发
+        'bilibili-live': { groups: oneGroup, health: ok },
+        // 平台路由按配置：选了 IPv6 转发就整条经服务器，频道上的旧标记不算数
+        'bestv-fj': { groups: [{ name: '百视通', dataList: [{ name: 'CCTV1', deferredRef: 'bestv-fj-165', relayHls: true }] }], health: ok },
+        // 抖音选了 HLS：本机只刷新清单
+        'douyin-live': { groups: [{ name: '抖音', dataList: [{ name: '主播', deferredRef: 'douyin-661585694546' }] }], health: ok },
+      },
+    })
+    const state = Object.fromEntries(manager.getState().modules.map(m => [m.id, m.mediaForwarding]))
+    assert.deepEqual(state.fjtv, { kind: 'some', forwarded: 1, total: 3 })
+    assert.deepEqual(state.jlntv, { kind: 'some', forwarded: 1, total: 2 })
+    assert.deepEqual(state['bilibili-live'], { kind: '', forwarded: 0, total: 1 })
+    assert.deepEqual(state['bestv-fj'], { kind: 'all', forwarded: 1, total: 1 })
+    assert.deepEqual(state['douyin-live'], { kind: '', forwarded: 0, total: 1 }, '选 HLS 不标')
+    // 没抓过：FLV 或平台路由 proxy 的按全部转发标；按频道各自声明的要抓过才知道
+    assert.equal(state.fengshows.kind, 'all', '凤凰是 FLV')
+    assert.equal(state.chongqing.kind, 'all', '重庆平台路由 proxy')
+    assert.equal(state.yangshipin.kind, '', '央视频只转清单')
+    assert.equal(state.dalian.kind, '', '大连按频道声明，没抓过不下结论')
+    // 与输出同源：标了转发的频道，写盘拿到的正是 proxyHls
+    const out = manager.getValidChannels().flatMap(group => group.dataList)
+    assert.equal(out.find(c => c.name === '吉林卫视').proxyHls, true)
+    assert.equal(out.find(c => c.name === 'CCTV1').proxyHls, true)
+    assert.equal(out.find(c => c.name === '东南卫视').proxyHls, undefined)
+
+    const flvDefault = newManager(undefined, { enabled: true, modules: {}, masterSwitchRetired: true }, {
+      modules: { 'douyin-live': { groups: [{ name: '抖音', dataList: [{ name: '主播', deferredRef: 'douyin-661585694546' }] }], health: ok } },
+    })
+    assert.equal(flvDefault.getState().modules.find(m => m.id === 'douyin-live').mediaForwarding.kind, 'all', '抖音默认 FLV 由本机转发')
+  })
+
+  check('★ 要登录的模块都声明凭证失效怎么办，并能让后台提醒中心知道（ADD-CHANNELS.md「登录凭证」）', () => {
+    // 凭证一定会过期：能降级就降级接着播，播不了的频道照留，两种都必须让后台提醒中心知道。
+    // 新加的模块只要有 secret 字段或浏览器登录，就会被这里拦下来要求补齐。
+    const needsLogin = m => (m.configSchema || []).some(field => field.secret) || typeof m.browserLoginFlow?.start === 'function'
+    const loginModules = listModules().filter(needsLogin)
+    assert.ok(loginModules.length >= 6, '至少凤凰、四川、咪咕、B 站、央视频、北京')
+    const admin = readFileSync(new URL('../web/admin.html', import.meta.url), 'utf8')
+    for (const m of loginModules) {
+      const c = m.credentialCheck
+      assert.ok(c && typeof c === 'object', `${m.id} 要登录却没声明 credentialCheck`)
+      assert.ok(c.refresh === true || c.playback === true, `${m.id} 刷新时和播放时都不检查凭证，失效了后台无从得知`)
+      assert.ok(typeof c.degrade === 'string' && c.degrade.trim(), `${m.id} 没写凭证失效后播放怎么办`)
+      if (c.playback) assert.equal(typeof m.credentialRejected, 'function', `${m.id} 声明播放时检查，却没实现 credentialRejected(config)`)
+      // 登录徽标跟着失效状态变（央视频的徽标由后台实时检查登录态驱动，不在此列）
+      if (m.helper && m.helper !== 'yangshipin-login') {
+        const start = admin.indexOf(`if (key === '${m.helper}')`)
+        assert.ok(start > 0, `${m.id} 的登录助手 ${m.helper} 不在 admin.html 里`)
+        const end = admin.indexOf("if (key === '", start + 10)
+        assert.match(admin.slice(start, end > 0 ? end : undefined), /health\.credentialRejected/, `${m.id} 的登录徽标没读 health.credentialRejected`)
+      }
+    }
+  })
+
+  check('模块分类透传给后台，未声明的模块默认归入免账号分类', () => {
+    const modules = newManager().getState().modules
+    for (const id of ['migu', 'beijing', 'fengshows', 'sichuan', 'yangshipin']) {
+      assert.equal(modules.find(module => module.id === id)?.category, 'account', `${id} 应归入账号与授权`)
+    }
+    for (const id of ['bilibili-live', 'huya-live', 'douyu-live']) {
+      assert.equal(modules.find(module => module.id === id)?.category, 'live', `${id} 应归入网络直播平台`)
+    }
+    // 默认关、由用户自己打开的：「海外」小节那几个，加上频道量大、只有本地少数人看的山东市县（#196 作者拍板）
+    // 和市县台的各省模块（guangdianyun-*，同样作者拍板）。
+    assert.deepEqual(
+      listModules().filter(module => module.defaultEnabled === false).map(module => module.id).sort(),
+      [
+        ...modules.filter(module => module.category === 'overseas').map(module => module.id),
+        'shandong-counties',
+        'bestv-fj',
+        'websports',
+        ...modules.filter(module => module.id.startsWith('guangdianyun-')).map(module => module.id),
+      ].sort(),
+    )
+    assert.deepEqual(modules.filter(module => module.category === 'overseas').map(module => module.id).sort(), ['overseas', 'redbull', 'tdm', 'xumo', 'youtube-live'])
+  })
+
+  check('模块地区透传给后台：省台、地市台、景观归到同一地区，全国性的不归', () => {
+    const regionOf = Object.fromEntries(newManager().getState().modules.map(module => [module.id, module.region]))
+    for (const id of ['iqilu', 'qingdao', 'qtv', 'shandong-counties']) assert.equal(regionOf[id], '山东', id)
+    for (const id of ['kankanews', 'kankanews-scenic', 'songjiang']) assert.equal(regionOf[id], '上海', id)
+    // 拆出来的景观卡片和原来的电视台卡片在同一个省面板里（北京电视台要 Cookie，在「账号」小节，不归面板）
+    for (const [id, region] of [['jlntv', '吉林'], ['jlntv-scenic', '吉林'], ['hebtv', '河北'], ['hebtv-scenic', '河北'],
+      ['njtv', '江苏'], ['njtv-scenic', '江苏'], ['beijing-scenic', '北京'], ['beijing', '']]) assert.equal(regionOf[id], region, id)
+    assert.equal(regionOf['bestv-fj'], '百视通')
+    for (const id of ['fengshows', 'hkstv']) assert.equal(regionOf[id], '香港', id)
+    // 专题面板：作者 10-24 定名
+    assert.equal(regionOf['asian-live'], '国际')
+    assert.equal(regionOf.livechina, '直播中国')
+    assert.equal(regionOf.ipanda, 'iPanda')
+    for (const id of ['yangshipin', 'overseas', 'redbull', 'youtube-live']) assert.equal(regionOf[id], '', id)
+    const state = newManager().getState().modules
+    assert.equal(state.find(module => module.id === 'iqilu').regionIsArea, true)
+    assert.equal(state.find(module => module.id === 'livechina').regionIsArea, false)
+    assert.equal(state.find(module => module.id === 'bestv-fj').regionIsArea, false)
+    for (const module of listModules()) {
+      if (module.region !== undefined) assert.ok(typeof module.region === 'string' && module.region.trim(), `${module.id} 的 region 要是非空名字`)
+    }
+  })
+
+  check('拆出来的景观卡片：splitFrom 都指向原模块、分组名照旧，注册表拒收写错的声明', () => {
+    const split = listModules().filter(module => module.splitFrom)
+    assert.deepEqual(split.map(module => [module.id, module.splitFrom.id, module.splitFrom.groups]), [
+      ['beijing-scenic', 'beijing', ['北京景观']],
+      ['jlntv-scenic', 'jlntv', ['吉林风景']],
+      ['hebtv-scenic', 'hebtv', ['河北景观']],
+      ['njtv-scenic', 'njtv', ['南京景观']],
+      ['kankanews-scenic', 'kankanews', ['上海景观']],
+    ])
+    const ids = listModules().map(module => module.id)
+    for (const module of split) {
+      // 紧跟在原模块后面：后台卡片挨着，合并顺序也不变
+      assert.equal(ids.indexOf(module.id), ids.indexOf(module.splitFrom.id) + 1, module.id)
+      assert.notEqual(module.defaultEnabled, false, `${module.id} 和原模块一样默认开`)
+      assert.equal(module.epg, undefined, `${module.id} 景观不出节目单`)
+      assert.equal(getModule(module.splitFrom.id).preserveGroupSuffixes, undefined, `${module.splitFrom.id} 不再输出景观分组`)
+    }
+    const base = { id: 'split-x', name: 'x', fetch() {}, capabilities: {} }
+    for (const bad of [{ id: 'jlntv' }, { id: 'jlntv', groups: [] }, { id: 'Bad Id', groups: ['x'] }, { id: 'split-x', groups: ['x'] }, { id: 'jlntv', groups: [' '] }]) {
+      assert.throws(() => validateModule({ ...base, splitFrom: bad }), /splitFrom/, JSON.stringify(bad))
+    }
+    validateModule({ ...base, splitFrom: { id: 'jlntv', groups: ['吉林风景'] } })
+  })
+
+  check('拆分迁移：旧缓存里的景观组搬到新卡，原模块关着的新卡也关，迁过一次就不再动用户的选择', () => {
+    const tvGroup = { name: '吉林', dataList: [{ name: '吉林卫视', deferredRef: 'jlntv-satellite' }] }
+    const scenicGroup = { name: '吉林风景', dataList: [{ name: '松原市·查干湖', deferredRef: 'jlntv-slow-chagan-lake' }] }
+    const hebtvTv = { name: '河北电视台', dataList: [{ name: '河北卫视', deferredRef: 'hebtv-10524916' }] }
+    const hebtvScenic = { name: '河北景观', dataList: [{ name: '石家庄', deferredRef: 'hebtv-11605050' }] }
+    const manager = newManager(undefined, {
+      enabled: true,
+      modules: { jlntv: { config: {}, enabled: false }, hebtv: { config: {}, enabled: true } },
+      masterSwitchRetired: true,
+    }, {
+      modules: {
+        jlntv: { groups: [tvGroup, scenicGroup], health: { status: 'ok', channelCount: 2 }, catalogVersion: 3 },
+        hebtv: { groups: [hebtvTv, hebtvScenic], health: { status: 'ok', channelCount: 2 } },
+      },
+    })
+    // 缓存：景观组挪到新卡，原模块只剩电视（河北两边引用写法相同，靠分组名分）
+    assert.deepEqual(manager.cache.modules.jlntv.groups.map(group => group.name), ['吉林'])
+    assert.equal(manager.cache.modules.jlntv.health.channelCount, 1)
+    assert.deepEqual(manager.cache.modules['jlntv-scenic'].groups, [scenicGroup])
+    assert.deepEqual(manager.cache.modules.hebtv.groups.map(group => group.name), ['河北电视台'])
+    assert.deepEqual(manager.cache.modules['hebtv-scenic'].groups, [hebtvScenic])
+    // 开关：原来关掉「吉林」的，「吉林风景」也关；开着的原模块不给新卡落值，按默认开
+    assert.equal(manager.isModuleEnabled(getModule('jlntv-scenic')), false)
+    assert.equal(manager.isModuleEnabled(getModule('hebtv-scenic')), true)
+    assert.equal(manager.config.modules['hebtv-scenic']?.enabled, undefined)
+    const saved = JSON.parse(readFileSync(manager.configPath, 'utf8'))
+    assert.equal(saved.modules['jlntv-scenic'].enabled, false)
+    for (const id of ['jlntv-scenic', 'hebtv-scenic', 'njtv-scenic', 'kankanews-scenic', 'beijing-scenic']) {
+      assert.equal(saved.migrated[`split:${id}`], true, id)
+    }
+    // 新卡关着也照样输出不了；原模块输出里没有景观组
+    assert.equal(manager.getValidChannels().some(group => group.name === '吉林风景'), false)
+    assert.equal(manager.getValidChannels().filter(group => group.name === '河北景观').length, 1)
+
+    // 迁过之后用户单独打开「吉林风景」：重启（reload）不会被关回去，缓存也不再搬
+    manager.setModuleEnabled('jlntv-scenic', true)
+    manager.reload()
+    assert.equal(manager.isModuleEnabled(getModule('jlntv-scenic')), true)
+    assert.deepEqual(manager.cache.modules['jlntv-scenic'].groups, [scenicGroup])
+  })
+
+  check('拆分迁移：新卡已有自己的缓存时不拿旧组覆盖；原模块默认开（没点过）时什么都不写', () => {
+    const fresh = { name: '上海景观', dataList: [{ name: '陆家嘴', deferredRef: 'kankanews-scenic-15989' }] }
+    const stale = { name: '上海景观', dataList: [{ name: '外滩观光平台', deferredRef: 'kankanews-scenic-13755' }] }
+    const manager = newManager(undefined, { enabled: true, modules: {}, masterSwitchRetired: true }, {
+      modules: {
+        kankanews: { groups: [{ name: '上海电视台', dataList: [{ name: '东方卫视', deferredRef: 'kankanews-1' }] }, stale], health: { status: 'ok' } },
+        'kankanews-scenic': { groups: [fresh], health: { status: 'ok' } },
+      },
+    })
+    assert.deepEqual(manager.cache.modules.kankanews.groups.map(group => group.name), ['上海电视台'])
+    assert.deepEqual(manager.cache.modules['kankanews-scenic'].groups, [fresh])
+    for (const id of ['kankanews-scenic', 'jlntv-scenic', 'beijing-scenic']) {
+      assert.equal(manager.config.modules[id]?.enabled, undefined, id)
+      assert.equal(manager.isModuleEnabled(getModule(id)), true, id)
+    }
+  })
+
+  check('拆分迁移：按源停用了原模块的配置档，新卡也停用；只迁一次，导入拆分前的备份会再迁', () => {
+    const profiles = {
+      default: { disabledSources: ['xt:njtv'] },
+      bedroom: { disabledSources: ['xt:beijing', 'xt:beijing-scenic'] },
+      kids: { disabledSources: [] },
+    }
+    const saves = []
+    const store = {
+      listProfiles: () => [{ id: 'default', name: '默认' }, { id: 'bedroom', name: '卧室' }, { id: 'kids', name: '儿童' }],
+      readConfig: id => JSON.parse(JSON.stringify(profiles[id])),
+      saveConfig: (id, config) => { saves.push(id); profiles[id] = config; return { success: true } },
+    }
+    const seq = ++caseSeq
+    const make = () => {
+      const manager = new ExtractorManager()
+      manager.configPath = join(tmp, `extractors-split-${seq}.json`)
+      manager.cachePath = join(tmp, `extractor-cache-split-${seq}.json`)
+      manager.legacyConfigPath = join(tmp, `system-config-split-${seq}.json`)
+      manager.profileStore = store
+      return manager
+    }
+    writeFileSync(join(tmp, `extractors-split-${seq}.json`), JSON.stringify({ enabled: true, modules: {}, masterSwitchRetired: true }))
+    make().load()
+    assert.deepEqual(profiles.default.disabledSources, ['xt:njtv', 'xt:njtv-scenic'])
+    assert.deepEqual(profiles.bedroom.disabledSources, ['xt:beijing', 'xt:beijing-scenic'], '已经停用了的不重复加')
+    assert.deepEqual(profiles.kids.disabledSources, [])
+    assert.deepEqual(saves, ['default'], '没变化的配置档不写盘')
+
+    // 用户在默认档里重新打开「南京景观」：再启动不会被关回去
+    profiles.default.disabledSources = ['xt:njtv']
+    make().load()
+    assert.deepEqual(profiles.default.disabledSources, ['xt:njtv'])
+    assert.deepEqual(saves, ['default'])
+
+    // 导入拆分前导出的备份：extractors.json 里没有迁移标记，按导入的配置档再迁一次
+    writeFileSync(join(tmp, `extractors-split-${seq}.json`), JSON.stringify({ enabled: true, modules: {}, masterSwitchRetired: true }))
+    make().load()
+    assert.deepEqual(profiles.default.disabledSources, ['xt:njtv', 'xt:njtv-scenic'])
+
+    // 测试里直接 new 的管理器不挂配置档：只迁开关，不碰任何配置档
+    const before = JSON.stringify(profiles)
+    newManager(undefined, { enabled: true, modules: { njtv: { config: {}, enabled: false } }, masterSwitchRetired: true })
+    assert.equal(JSON.stringify(profiles), before)
+  })
+
+  check('注册表允许的每个分类，后台源管理都有对应的小节（漏了的话那类卡片整片不显示）', () => {
+    const admin = readFileSync(new URL('../web/admin.html', import.meta.url), 'utf8')
+    const start = admin.indexOf('const categories = [')
+    const block = admin.slice(start, admin.indexOf('];', start))
+    for (const id of MODULE_CATEGORIES) assert.match(block, new RegExp(`id: '${id}'`), `后台缺「${id}」小节`)
+    assert.match(admin, /\.source-badge\.overseas/, '海外小节的角标要有样式')
+  })
+
+  check('outbound / proxyProbe / proxyHosts 的声明校验：只认 proxy，声明了就要给探测目标和要放行的域名，没声明不许带', () => {
+    const base = { id: 'probe-x', name: 'x', fetch() {}, capabilities: {} }
+    assert.throws(() => validateModule({ ...base, outbound: 'direct' }), /outbound 非法/)
+    assert.throws(() => validateModule({ ...base, outbound: 'proxy' }), /proxyProbe/)
+    assert.throws(() => validateModule({ ...base, outbound: 'proxy', proxyProbe: { url: 'ftp://x/' } }), /proxyProbe/)
+    assert.throws(() => validateModule({ ...base, outbound: 'proxy', proxyProbe: { url: 'https://x/', name: ' ' } }), /proxyProbe\.name/)
+    assert.throws(() => validateModule({ ...base, proxyProbe: { url: 'https://x/' } }), /没声明 outbound/)
+    assert.throws(() => validateModule({ ...base, proxyHosts: ['x.example'] }), /没声明 outbound/)
+    const probe = { url: 'https://www.x.example/ping' }
+    assert.throws(() => validateModule({ ...base, outbound: 'proxy', proxyProbe: probe }), /proxyHosts/)
+    assert.throws(() => validateModule({ ...base, outbound: 'proxy', proxyProbe: probe, proxyHosts: [] }), /proxyHosts/)
+    for (const bad of ['https://x.example', 'x.example/', '*.x.example', 'X.example', 'example', 'x.example:443']) {
+      assert.throws(() => validateModule({ ...base, outbound: 'proxy', proxyProbe: probe, proxyHosts: [bad] }), /proxyHosts/, bad)
+    }
+    assert.throws(() => validateModule({ ...base, outbound: 'proxy', proxyProbe: probe, proxyHosts: ['other.example'] }), /不在 proxyHosts 里/)
+    validateModule({ ...base, outbound: 'proxy', proxyProbe: probe, proxyHosts: ['x.example'] })
+    validateModule({ ...base, outbound: 'proxy', proxyProbe: probe, proxyHosts: ['cdn.example', 'www.x.example'] })
+  })
+
+  check('★ 走代理的模块：名单只来自声明；声明了的出站只许 outboundFetch，没声明的目录不许偷用', () => {
+    const root = new URL('../extractors/', import.meta.url)
+    const filesOf = dir => readdirSync(new URL(`${dir}/`, root))
+      .filter(file => file.endsWith('.js'))
+      .map(file => ({ file, src: readFileSync(new URL(`${dir}/${file}`, root), 'utf8') }))
+    // 一个目录可能出多个模块（广电云），守门按目录：引用了 outboundProxy.js 的目录必须恰好是声明了走代理的模块的目录
+    const dirs = readdirSync(root).filter(name => existsSync(new URL(`${name}/index.js`, root)))
+    const declared = proxyModules().map(module => module.id)
+    assert.deepEqual(declared, ['tdm', 'youtube-live', 'redbull', 'xumo', 'overseas'],
+      '走代理的名单变了：按 ADD-CHANNELS.md「要走代理的模块」做完再改这里')
+    for (const dir of declared) assert.ok(dirs.includes(dir), `${dir} 走代理的模块目录名要和 id 一致`)
+    const using = dirs.filter(dir => filesOf(dir).some(({ src }) => /outboundProxy\.js/.test(src)))
+    assert.deepEqual([...using].sort(), [...declared].sort(),
+      '引用 utils/outboundProxy.js 的目录必须恰好是声明了 outbound: proxy 的模块：接了代理就要登记，登记了就要接')
+    for (const module of proxyModules()) {
+      assert.match(module.proxyProbe.url, /^https:\/\//, `${module.id} 的探测目标要是 https，才能顺带验证隧道`)
+      assert.equal(module.defaultEnabled, false, `${module.id} 走代理的模块默认关，由用户确认代理可用后打开`)
+      if (module.capabilities?.resolve) assert.equal(typeof module.fetchProxyMedia, 'function', `${module.id} 要声明 fetchProxyMedia，清单和分片才走代理`)
+      if (module.capabilities?.epg) assert.equal(typeof module.epgFetch, 'function', `${module.id} 要声明 epgFetch，节目单才走代理`)
+      for (const { file, src } of filesOf(module.id)) {
+        assert.doesNotMatch(src, /proxyAwareFetch|directFamilyFetch|systemProxyDispatcher|from ['"]undici['"]|node:https/,
+          `${module.id}/${file} 走代理的模块不许绕开 outboundFetch`)
+        // 裸的全局 fetch(...) 不走代理。方法定义 `async fetch(config)` 不算；参数默认值要写 outboundFetch
+        for (const [index, line] of src.split('\n').entries()) {
+          if (/^\s*(async\s+)?fetch\s*\(/.test(line)) continue
+          assert.doesNotMatch(line, /(?<![\w.$])fetch\s*\(/, `${module.id}/${file}:${index + 1} 直接调了全局 fetch，不会走代理`)
+        }
+      }
+    }
+  })
+
+  check('★ 回看声明：除咪咕外每个模块都写明 capabilities.catchup: false，频道逐条标 catchup:\'none\'', () => {
+    // 订阅头带着咪咕的回看模板（catchup="append"），没标 catchup="none" 的频道都会继承；模块没写
+    // capabilities.catchup: false 的，播放时还会把 playbackbegin / playbackend 原样拼到上游地址后面。
+    // 2026-11-19 实测 23 个漏了声明的省台、城市台、景观模块：带上参数要么照回直播，要么把地址拼坏（403/404）。
+    // 真接了官方回看的模块才加进 SUPPORTS_CATCHUP
+    const SUPPORTS_CATCHUP = ['migu']
+    const undeclared = listModules()
+      .filter(module => !SUPPORTS_CATCHUP.includes(module.id) && module.capabilities?.catchup !== false)
+      .map(module => module.id)
+    assert.deepEqual(undeclared, [],
+      '这些模块没声明回看：不支持就写 capabilities.catchup: false，并给每个频道标 catchup:\'none\'')
+    for (const id of SUPPORTS_CATCHUP) assert.notEqual(getModule(id).capabilities?.catchup, false, `${id} 的回看要保留`)
+
+    // 频道那一半按目录静态看（一个目录可能出多个模块）：至少有一处给频道标 catchup:'none'，防整个模块漏掉
+    const root = new URL('../extractors/', import.meta.url)
+    // 这三个直播平台模块一直只有模块级声明、没逐条标；直播间没有节目单，这次没动
+    const ROOMS_WITHOUT_EPG = ['bilibili-live', 'douyu-live', 'huya-live']
+    const unstamped = readdirSync(root)
+      .filter(name => existsSync(new URL(`${name}/index.js`, root)))
+      .filter(dir => !SUPPORTS_CATCHUP.includes(dir) && !ROOMS_WITHOUT_EPG.includes(dir))
+      .filter(dir => !readdirSync(new URL(`${dir}/`, root)).some(file => file.endsWith('.js')
+        && /catchup: ?'none'/.test(readFileSync(new URL(`${dir}/${file}`, root), 'utf8'))))
+    assert.deepEqual(unstamped, [], '这些模块目录里没有一处给频道标 catchup:\'none\'')
+  })
+
+  check('★ 走代理的模块：proxyHosts 盖住模块真会连的域名——探测目标、海外频道表里的每条流和取表的 GitHub', () => {
+    for (const [host, suffix] of [
+      ['www.tdm.com.mo', 'tdm.com.mo'], ['live5.tdm.com.mo', 'tdm.com.mo'], ['api.telegram.org', 'telegram.org'],
+      ['manifest.googlevideo.com', 'googlevideo.com'], ['rr3---sn-abc.googlevideo.com', 'googlevideo.com'],
+      ['amg00654-itv.playouts.now.amagi.tv', 'amagi.tv'], ['tv-trtworld.medya.trt.com.tr', 'trt.com.tr'],
+      ['x.mediatailor.us-west-2.amazonaws.com', 'amazonaws.com'], ['raw.githubusercontent.com', 'githubusercontent.com'],
+      ['bbc.co.uk', 'bbc.co.uk'], ['example.com', 'example.com'], ['localhost', 'localhost'],
+    ]) assert.equal(domainSuffix(host), suffix, host)
+    assert.equal(hostCoveredBy('www.tdm.com.mo', ['tdm.com.mo']), true)
+    assert.equal(hostCoveredBy('tdm.com.mo', ['tdm.com.mo']), true)
+    assert.equal(hostCoveredBy('nottdm.com.mo', ['tdm.com.mo']), false)
+    assert.deepEqual(getModule('tdm').proxyHosts, ['tdm.com.mo'])
+    assert.deepEqual(getModule('youtube-live').proxyHosts, ['youtube.com', 'googlevideo.com'])
+    const overseas = getModule('overseas')
+    const playlist = readFileSync(new URL('../IPTV-overseas.m3u', import.meta.url), 'utf8')
+    assert.deepEqual(overseas.proxyHosts, proxyHostsOf(playlist), '海外频道的名单按镜像自带的频道表派生')
+    assert.ok(overseas.proxyHosts.includes('githubusercontent.com'), '运行时从 GitHub 取频道表，GitHub 也得走代理')
+    assert.ok(overseas.proxyHosts.includes('akamaized.net') && overseas.proxyHosts.includes('amagi.tv'))
+    assert.ok(overseas.proxyHosts.length < 30, `几十个 CDN 主机该收成后缀，现在 ${overseas.proxyHosts.length} 条`)
+    let streams = 0
+    for (const line of playlist.split('\n')) {
+      const match = line.match(/^\s*https?:\/\/([^/\s:?#]+)/i)
+      if (!match) continue
+      streams++
+      assert.ok(hostCoveredBy(match[1], overseas.proxyHosts), `频道表里的 ${match[1]} 没被放行名单盖住`)
+    }
+    assert.ok(streams > 30, `频道表只数出 ${streams} 条流`)
+    assert.ok(!hostCoveredBy('image.xumo.com', overseas.proxyHosts), '台标主机由播放器自己取，不进名单')
+    assert.deepEqual(proxyHostsOf('#EXTM3U\nhttp://a.b.example/x\n#EXTINF:-1 tvg-logo="https://logo.example/l.png",T\nhttps://c.example:443/y\n', ''),
+      ['b.example', 'c.example'])
+  })
+
+  check('★ 所有非代理抓取模块首次出现默认开启，显式关闭后保持关闭', () => {
+    // 跳过旧总开关迁移，只验证当前版本的模块默认值；代理模块继续听自己的 getter。
+    // 声明了 defaultEnabled:false 的（海外频道、澳门）默认关，见下一条
+    const manager = newManager(undefined, { modules: {}, masterSwitchRetired: true })
+    const regular = listModules().filter(module => typeof module.enabledGetter !== 'function' && module.defaultEnabled !== false)
+    assert.ok(regular.length > 0)
+    assert.deepEqual(
+      regular.filter(module => !manager.isModuleEnabled(module)).map(module => module.id),
+      [],
+      '新注册模块和从未保存开关的模块都应开箱启用',
+    )
+
+    manager.setModuleEnabled('kankanews', false)
+    manager.load()
+    assert.equal(manager.isModuleEnabled(getModule('kankanews')), false,
+      '用户明确保存的关闭态不能被默认值覆盖')
+  })
+
+  check('★ 百视通、海外频道、澳门、山东市县、市县台默认关闭，用户打开后保持打开；没点过的开关不落盘', () => {
+    const optIn = listModules().filter(module => module.defaultEnabled === false).map(module => module.id)
+    const gdy = optIn.filter(id => id.startsWith('guangdianyun-'))
+    assert.ok(gdy.length >= 20, '市县台各省模块都默认关闭')
+    assert.equal(listModules().filter(module => module.id.startsWith('guangdianyun-')).length, gdy.length)
+    assert.deepEqual(optIn.filter(id => !id.startsWith('guangdianyun-')).sort(),
+      ['bestv-fj', 'overseas', 'redbull', 'shandong-counties', 'tdm', 'websports', 'xumo', 'youtube-live'],
+      '百视通因出口可用性差异默认关闭；WebSports 来自第三方赛事网站；其余默认关闭模块保持不变')
+    const manager = newManager(undefined, { modules: {}, masterSwitchRetired: true })
+    for (const id of optIn) assert.equal(manager.isModuleEnabled(getModule(id)), false, id)
+    manager.setModuleEnabled('overseas', true)
+    manager.setModuleEnabled('bestv-fj', true)
+    manager.load()
+    assert.equal(manager.isModuleEnabled(getModule('overseas')), true)
+    assert.equal(manager.isModuleEnabled(getModule('bestv-fj')), true, '用户手动开启百视通后，重载仍保持开启')
+    assert.equal(manager.isModuleEnabled(getModule('tdm')), false)
+    const saved = JSON.parse(readFileSync(manager.configPath, 'utf-8')).modules
+    assert.equal(saved.overseas.enabled, true)
+    assert.equal(saved['bestv-fj'].enabled, true)
+    manager.setModuleEnabled('bestv-fj', false)
+    manager.load()
+    assert.equal(manager.isModuleEnabled(getModule('bestv-fj')), false, '用户手动关闭百视通后，重载仍保持关闭')
+    assert.equal(saved.tdm?.enabled, undefined, '没点过的不落值，以后改这个模块的默认值时存量用户跟得上')
+    assert.equal(saved.kankanews?.enabled, undefined)
+    assert.throws(() => validateModule({ id: 'probe', name: 'probe', defaultEnabled: 'no', fetch: async () => ({ groups: [] }) }), /defaultEnabled/)
+  })
+
+  check('代理开关的模块不受抓取子系统总开关约束', () => {
+    // config.js 明写「可 mblank=true + menableMigu=true 单独留咪咕」。咪咕若被
+    // enableExtractors 一起管掉，这个既有组合就废了。总开关是 config.js 的 live
+    // binding、单测里改不了，所以这里验的是「代理开关的模块走的是另一条判定路径」
+    // ——只要它读的是自己的 getter 而不是子系统开关，上面那条语义就成立。
+    const manager = newManager()
+    assert.equal(typeof getModule('migu').enabledGetter, 'function', '咪咕必须用代理开关')
+    assert.equal(manager.isModuleEnabled(getModule('migu')), getModule('migu').enabledGetter(),
+      '代理模块的启用状态必须等于它自己的 getter')
+    manager.setModuleEnabled('bilibili-live', false)
+    assert.equal(manager.isModuleEnabled(getModule('bilibili-live')), false, '普通模块读 entry.enabled')
+  })
+
+  check('代理开关的模块读写都走自己的 getter/setter，不碰 extractors.json', () => {
+    // 咪咕的开关是 config.js 的 enableMigu（被六处直接 import，带 env 与 mblank 语义），
+    // 模块只是把读写入口挪到自己名下。这里不实际调 setter——它写的是
+    // dataPath('system-config.json')，在测试里就是仓库根目录。
+    const migu = getModule('migu')
+    assert.equal(typeof migu.enabledGetter, 'function')
+    assert.equal(typeof migu.enabledSetter, 'function', '开关要可写，否则卡片里是个死复选框')
+    const manager = newManager()
+    manager.setModuleEnabled('bilibili-live', true)
+    manager.effectiveConfig(migu)   // 触发 entry 初始化
+    assert.equal('enabled' in (manager.config.modules.migu || {}), false,
+      '代理模块不该在 extractors.json 里留 enabled——存了也不读，只会误导看文件的人')
+    assert.equal(manager.config.modules['bilibili-live'].enabled, true, '普通模块照常存')
+  })
+
+  // ---- 批量开关（issue #189「建议出个精简版」）----
+  // 批量写的是每张卡片自己的开关，不是另一层白名单；要验的是「整批原子」与「稀疏存储不被批量破坏」。
+
+  /** 数写盘次数：#saveConfig 是私有的，但 load 之后只有它会读 configPath。 */
+  const countSaves = manager => {
+    const configPath = manager.configPath
+    const counter = { saves: 0 }
+    Object.defineProperty(manager, 'configPath', {
+      configurable: true, enumerable: true, get: () => { counter.saves++; return configPath },
+    })
+    counter.restore = () => Object.defineProperty(manager, 'configPath', {
+      configurable: true, enumerable: true, writable: true, value: configPath,
+    })
+    return counter
+  }
+
+  /**
+   * 临时把模块的开关换成内存里的假 getter/setter。咪咕的真 setter 写 dataPath('system-config.json')，
+   * 测试里就是仓库根目录，绝不能真调；finally 里原样还原（原先没有的属性要删掉，不能留个 undefined）。
+   */
+  const stubSwitch = (id, initial, setter) => {
+    const module = getModule(id)
+    const saved = ['enabledGetter', 'enabledSetter'].map(key => [key, Object.getOwnPropertyDescriptor(module, key)])
+    const state = { on: initial, calls: [] }
+    module.enabledGetter = () => state.on
+    module.enabledSetter = setter || (on => { state.calls.push(on); state.on = on })
+    state.restore = () => {
+      for (const [key, descriptor] of saved) {
+        if (descriptor) Object.defineProperty(module, key, descriptor)
+        else delete module[key]
+      }
+    }
+    return state
+  }
+
+  check('★ 批量开关：整批只写一次盘，重载后仍在；与当前值相同的不落 enabled（稀疏存储）', () => {
+    const manager = newManager(undefined, { modules: {}, masterSwitchRetired: true })
+    const counter = countSaves(manager)
+    try {
+      manager.setModulesEnabled({ 'bilibili-live': false, kankanews: false, overseas: true, 'huya-live': true })
+      assert.equal(counter.saves, 1, '几十张卡片一次点完也只写一次 extractors.json')
+      manager.setModulesEnabled({ 'huya-live': true, overseas: true })
+      manager.setModulesEnabled({})
+      assert.equal(counter.saves, 1, '一个都没变就不写盘')
+    } finally { counter.restore() }
+
+    manager.load()
+    assert.equal(manager.isModuleEnabled(getModule('bilibili-live')), false)
+    assert.equal(manager.isModuleEnabled(getModule('kankanews')), false)
+    assert.equal(manager.isModuleEnabled(getModule('overseas')), true)
+    assert.equal(manager.isModuleEnabled(getModule('huya-live')), true)
+    const saved = JSON.parse(readFileSync(manager.configPath, 'utf-8')).modules
+    assert.equal(saved['bilibili-live'].enabled, false)
+    assert.equal(saved.overseas.enabled, true)
+    assert.equal(saved['huya-live']?.enabled, undefined,
+      '没点过、默认开的模块请求开：不落值，以后改它的 defaultEnabled 存量用户跟得上')
+    assert.equal(saved.tdm?.enabled, undefined, '没在请求里的模块一概不碰')
+  })
+
+  check('★ 批量开关：未知 id / 非布尔值 / 参数不是对象，整单拒绝且什么都没变', () => {
+    const manager = newManager(undefined, { modules: {}, masterSwitchRetired: true })
+    const fileBefore = readFileSync(manager.configPath, 'utf-8')
+    const counter = countSaves(manager)
+    try {
+      // 合法项排在前面：校验必须先于任何改动，不能改到一半才发现后面那项不合法
+      assert.throws(() => manager.setModulesEnabled({ 'bilibili-live': false, 'no-such-module': false }), /未知的抓取模块/)
+      assert.throws(() => manager.setModulesEnabled({ kankanews: false, 'bilibili-live': 'false' }), /true \/ false/,
+        "字符串 'false' 是真值，放过去就是把要关的整片打开")
+      for (const bad of [0, 1, null, undefined, 'true']) {
+        assert.throws(() => manager.setModulesEnabled({ 'bilibili-live': bad }), /true \/ false/, `${JSON.stringify(bad)} 不该通过`)
+      }
+      for (const bad of [null, undefined, [], ['bilibili-live'], 'bilibili-live', 1, true]) {
+        assert.throws(() => manager.setModulesEnabled(bad), /对象/, `${JSON.stringify(bad)} 不该通过`)
+      }
+      assert.equal(counter.saves, 0, '拒绝的请求一次盘都不写')
+    } finally { counter.restore() }
+    assert.equal(manager.isModuleEnabled(getModule('bilibili-live')), true)
+    assert.equal(manager.isModuleEnabled(getModule('kankanews')), true)
+    assert.equal('enabled' in (manager.config.modules.kankanews || {}), false, '内存里也不能留下半截改动')
+    assert.equal(readFileSync(manager.configPath, 'utf-8'), fileBefore)
+  })
+
+  check('★ 批量开关：配置损坏时拒绝写盘，内存逐项精确回滚（没点过的回到没有 enabled 键）', () => {
+    const badDir = mkdtempSync(join(tmpdir(), 'iptv-extractors-bulk-corrupt-'))
+    try {
+      const badPath = join(badDir, 'extractors.json')
+      writeFileSync(badPath, '{ 这不是合法 JSON')
+      const manager = new ExtractorManager()
+      manager.configPath = badPath
+      manager.cachePath = join(badDir, 'extractor-cache.json')
+      manager.legacyConfigPath = join(badDir, 'system-config.json')
+      manager.load()
+      assert.ok(manager.corrupt, '前提：损坏标记已置位')
+      manager.config.modules.kankanews = { config: {}, enabled: false }   // 点过的：回滚后仍是 false
+      assert.throws(() => manager.setModulesEnabled({ 'bilibili-live': false, overseas: true, kankanews: true }), /损坏/)
+      assert.equal(manager.isModuleEnabled(getModule('bilibili-live')), true)
+      assert.equal(manager.isModuleEnabled(getModule('overseas')), false)
+      assert.equal(manager.isModuleEnabled(getModule('kankanews')), false)
+      assert.equal('enabled' in manager.config.modules['bilibili-live'], false, '没点过的要回到没有键，不能落成 true')
+      assert.equal('enabled' in manager.config.modules.overseas, false)
+      assert.ok(readFileSync(badPath, 'utf-8').includes('这不是合法 JSON'), '原文件必须原样保留')
+    } finally {
+      rmSync(badDir, { recursive: true, force: true })
+    }
+  })
+
+  check('★ 批量开关：代理模块（咪咕）只在值变了时调 setter，从不写进 extractors.json', () => {
+    const migu = stubSwitch('migu', true)
+    try {
+      const manager = newManager(undefined, { modules: {}, masterSwitchRetired: true })
+      manager.setModulesEnabled({ migu: true, 'bilibili-live': false })
+      assert.deepEqual(migu.calls, [], '值没变就不调——它要写 system-config.json 并重载整份配置')
+      manager.setModulesEnabled({ migu: false, kankanews: false })
+      assert.deepEqual(migu.calls, [false])
+      assert.equal(manager.isModuleEnabled(getModule('migu')), false)
+      const saved = JSON.parse(readFileSync(manager.configPath, 'utf-8')).modules
+      assert.equal('enabled' in (saved.migu || {}), false, '代理模块的开关存在别处，这里存了也不读')
+      assert.equal(saved.kankanews.enabled, false)
+
+      // 配置损坏挡不住只动咪咕的批量：它根本不写 extractors.json（与单开关一致）
+      manager.corrupt = { message: '测试用损坏', at: Date.now(), path: manager.configPath }
+      manager.setModulesEnabled({ migu: true, kankanews: false })
+      assert.deepEqual(migu.calls, [false, true])
+      // 带上要写盘的非代理模块就整单被拒，且咪咕的 setter 不能先被调
+      assert.throws(() => manager.setModulesEnabled({ migu: false, 'bilibili-live': true }), /损坏/)
+      assert.deepEqual(migu.calls, [false, true], '写盘失败时代理 setter 一次都不该调')
+      assert.equal(manager.isModuleEnabled(getModule('bilibili-live')), false)
+    } finally {
+      migu.restore()
+    }
+    assert.equal(typeof getModule('migu').enabledSetter, 'function', '还原后咪咕仍是代理开关')
+  })
+
+  check('★ 批量开关：代理 setter 失败时撤回已落盘的非代理改动，已调过的 setter 也翻回去', () => {
+    const migu = stubSwitch('migu', true)
+    // 澳门借来当第二个代理模块，验证「前一个 setter 已生效、后一个失败」时前一个被翻回
+    const tdm = stubSwitch('tdm', false, () => { throw new Error('写 system-config.json 失败') })
+    try {
+      const manager = newManager(undefined, { modules: {}, masterSwitchRetired: true })
+      assert.throws(
+        () => manager.setModulesEnabled({ 'huya-live': false, overseas: true, migu: false, tdm: true }),
+        /写 system-config\.json 失败/)
+      assert.deepEqual(migu.calls, [false, true], '咪咕先关上，tdm 失败后要翻回开')
+      assert.equal(manager.isModuleEnabled(getModule('migu')), true)
+      assert.equal(manager.isModuleEnabled(getModule('huya-live')), true)
+      assert.equal(manager.isModuleEnabled(getModule('overseas')), false)
+      assert.equal('enabled' in manager.config.modules['huya-live'], false)
+      const saved = JSON.parse(readFileSync(manager.configPath, 'utf-8')).modules
+      assert.equal(saved['huya-live']?.enabled, undefined, '磁盘也要写回去，不然重启后半截改动又冒出来')
+      assert.equal(saved.overseas?.enabled, undefined)
+    } finally {
+      tdm.restore()
+      migu.restore()
+    }
+    assert.equal(typeof getModule('tdm').enabledGetter, 'undefined', '借用完的模块要还原成非代理')
+  })
+
+  check('批量开关的内置源开关：只认两个键、值必须严格布尔，只回传与当前值不同的', () => {
+    const current = { enableBuiltInSources: true, enableBuiltInSubscriptions: false }
+    assert.deepEqual(contentFlagChanges(undefined, current), [], '不传就是不改')
+    assert.deepEqual(contentFlagChanges({}, current), [])
+    assert.deepEqual(
+      contentFlagChanges({ enableBuiltInSubscriptions: true, enableBuiltInSources: true }, current),
+      [['enableBuiltInSubscriptions', true]],
+      '与当前值相同的不写')
+    assert.deepEqual(
+      contentFlagChanges({ enableBuiltInSubscriptions: true, enableBuiltInSources: false }, current),
+      [['enableBuiltInSources', false], ['enableBuiltInSubscriptions', true]])
+    assert.throws(() => contentFlagChanges({ enableMigu: false }, current), /不支持的开关/,
+      '咪咕是抓取模块，走 modules 那一半，不能两条路写同一个值')
+    assert.throws(() => contentFlagChanges({ enableBuiltInSources: 'false' }, current), /true \/ false/)
+    for (const bad of [null, [], 'enableBuiltInSources', true]) {
+      assert.throws(() => contentFlagChanges(bad, current), /对象/, `${JSON.stringify(bad)} 不该通过`)
+    }
+    // 内置源开关不合法时 API 在碰任何模块之前就返回（这条路不碰单例、不写盘、不重生成）
+    const rejected = setExtractorsEnabledAPI({ modules: { 'bilibili-live': false }, contentFlags: { enableMigu: false } })
+    assert.equal(rejected.success, false)
+    assert.match(rejected.message, /不支持的开关/)
+  })
+
+  check('输出：频道被盖上 source=extractor 与 xt: 命名空间的 sourceId', () => {
+    const manager = newManager()
+    manager.setModuleEnabled('bilibili-live', true)
+    seed(manager, oneGroup)
+    const [group] = manager.getValidChannels()
+    assert.equal(group.name, '赛事')
+    const [channel] = group.dataList
+    assert.equal(channel.source, 'extractor', '不能靠「有没有 url」被推断成外部源')
+    assert.equal(channel.sourceId, 'xt:bilibili-live')
+    assert.equal(channel.groupTitle, '赛事')
+    assert.deepEqual(channel.opts, ['http-referrer=https://live.bilibili.com/'])
+  })
+
+  check('输出：opts 过消毒，白名单外的键进不了播放列表', () => {
+    const manager = newManager()
+    manager.setModuleEnabled('bilibili-live', true)
+    seed(manager, [{ name: 'G', dataList: [{ name: 'A', url: 'u', opts: ['program=/bin/sh', 'http-referrer=https://x/'] }] }])
+    const [channel] = manager.getValidChannels()[0].dataList
+    assert.deepEqual(channel.opts, ['http-referrer=https://x/'])
+  })
+
+  check('输出：平台级 HLS 模式覆盖旧频道缓存', () => {
+    const manager = newManager()
+    manager.cache.modules.livechina = {
+      groups: [{
+        name: '央视景观',
+        dataList: [{
+          name: '西藏｜测试景观',
+          deferredRef: 'livechina-test',
+          relayHls: true,
+        }],
+      }],
+      health: { status: 'ok' },
+    }
+    const group = manager.getValidChannels().find(item => item.name === '央视景观')
+    const [channel] = group.dataList
+    assert.equal(channel.proxyHls, true, '央视景观升级后应立即改为清单与分片全代理')
+    assert.equal(channel.relayHls, false, '旧缓存中的只中转清单标记必须被覆盖')
+  })
+
+  check('输出：纯直播模块的旧频道缓存也立即标 catchup:none，咪咕不动', () => {
+    const manager = newManager()
+    // 升级前抓下的缓存：频道上还没有 catchup 字段
+    manager.cache.modules.njtv = {
+      groups: [{ name: '南京', dataList: [{ name: '南京新闻综合', url: 'https://example.com/nj.m3u8' }] }],
+      health: { status: 'ok' },
+    }
+    manager.cache.modules.migu = {
+      groups: [{ name: '央视', dataList: [{ name: 'CCTV1', deferredRef: '608807420' }] }],
+      health: { status: 'ok' },
+    }
+    const channels = manager.getValidChannels().flatMap(group => group.dataList)
+    assert.equal(channels.find(ch => ch.name === '南京新闻综合')?.catchup, 'none',
+      '旧缓存不补的话，要等下一轮抓取才不继承订阅头的回看模板')
+    const migu = channels.find(ch => ch.name === 'CCTV1')
+    assert.ok(migu, '咪咕默认开着，旧缓存照常输出')
+    assert.equal(migu.catchup, undefined, '咪咕的回看要保留')
+  })
+
+  check('输出：省市分组与管理卡片同名，旧缓存也立即生效', () => {
+    const manager = newManager()
+    manager.cache.modules.dalian = {
+      groups: [{ name: '辽宁频道', dataList: [{ name: '大连新闻综合', deferredRef: 'dalian-7' }] }],
+      health: { status: 'ok' },
+    }
+    manager.cache.modules.gztv = {
+      groups: [{ name: '广州电视台', dataList: [{ name: '广州综合', deferredRef: 'gztv-3001' }] }],
+      health: { status: 'ok' },
+    }
+    manager.cache.modules.sztv = {
+      groups: [{ name: '深圳电视台', dataList: [{ name: '深圳卫视', deferredRef: 'sztv-7867' }] }],
+      health: { status: 'ok' },
+    }
+    manager.cache.modules.kankanews = {
+      groups: [{ name: '上海电视台', dataList: [{ name: '上海新闻', deferredRef: 'kankanews-tv-1' }] }],
+      health: { status: 'ok' },
+    }
+    manager.cache.modules['kankanews-scenic'] = {
+      groups: [{ name: '上海景观', dataList: [{ name: '外滩', deferredRef: 'kankanews-scenic-1' }] }],
+      health: { status: 'ok' },
+    }
+    const groups = manager.getValidChannels()
+    assert.deepEqual(groups.map(group => group.name), ['辽宁', '广东', '上海', '上海景观'])
+    assert.equal(groups.find(group => group.name === '广东').dataList.length, 2)
+  })
+
+  // issue #146：咪咕排在注册表第一，它补进「上海」的频道若照常插入，
+  // 会抢到组内源1，还会让「上海」挤到地方台最前。
+  check('输出：补充频道排在同组官方频道之后，也不决定分组位置', () => {
+    const manager = newManager()
+    manager.cache.modules.migu = {
+      groups: [
+        { name: '江苏', dataList: [{ name: '财富天下', deferredRef: '9' }] },
+        { name: '上海', dataList: [
+          { name: '上海新闻综合', deferredRef: '651632657', supplement: true, wantsPlayback: false },
+          { name: '上视东方影视', deferredRef: '617290047', supplement: true, wantsPlayback: true },
+        ] },
+      ],
+      health: { status: 'ok' },
+    }
+    manager.cache.modules.dalian = {
+      groups: [{ name: '辽宁频道', dataList: [{ name: '大连新闻综合', deferredRef: 'dalian-7' }] }],
+      health: { status: 'ok' },
+    }
+    manager.cache.modules.kankanews = {
+      groups: [{ name: '上海电视台', dataList: [
+        { name: '东方卫视', deferredRef: 'kankanews-1' },
+        { name: '上海新闻综合', deferredRef: 'kankanews-2' },
+      ] }],
+      health: { status: 'ok' },
+    }
+    const groups = manager.getValidChannels()
+    assert.deepEqual(groups.map(group => group.name), ['江苏', '辽宁', '上海'],
+      '「上海」的位置该由看看新闻决定，不能被咪咕的备用线路提到前面')
+    const shanghai = groups.find(group => group.name === '上海').dataList
+    assert.deepEqual(shanghai.map(channel => [channel.name, channel.sourceId]), [
+      ['东方卫视', 'xt:kankanews'],
+      ['上海新闻综合', 'xt:kankanews'],
+      ['上海新闻综合', 'migu'],
+      ['上视东方影视', 'migu'],
+    ])
+    assert.equal(shanghai[2].wantsPlayback, false, '官方也有的台不抓咪咕节目单，共用官方的')
+
+    // 官方模块没出频道时，补充频道照样输出，分组补在最后
+    delete manager.cache.modules.kankanews
+    const fallback = manager.getValidChannels()
+    assert.deepEqual(fallback.map(group => group.name), ['江苏', '辽宁', '上海'])
+    assert.deepEqual(fallback[2].dataList.map(channel => channel.deferredRef), ['651632657', '617290047'])
+  })
+
+  check('输出：打头频道排到同组模块频道最前，多个时保持原顺序，不改变分组位置', () => {
+    const manager = newManager()
+    manager.setModuleEnabled('shandong-counties', true)
+    manager.cache.modules['shandong-counties'] = {
+      groups: [
+        { name: '山东-济南', dataList: [{ name: '长清综合', deferredRef: 'sdcounty-171-2' }] },
+        { name: '山东-菏泽', dataList: [
+          { name: '牡丹区新闻综合', deferredRef: 'sdcounty-219-6' },
+          { name: '定陶综合', deferredRef: 'sdcounty-27-7' },
+        ] },
+      ],
+      health: { status: 'ok' },
+    }
+    manager.setModuleEnabled('guangdianyun-shandong', true)
+    manager.cache.modules['guangdianyun-shandong'] = {
+      groups: [{ name: '山东-菏泽', dataList: [
+        { name: '菏泽一套', deferredRef: 'gdy-3492-4042', leading: true },
+        { name: '菏泽二套', deferredRef: 'gdy-3493-4042', leading: true },
+      ] }],
+      health: { status: 'ok' },
+    }
+    const groups = manager.getValidChannels()
+    assert.deepEqual(groups.map(group => group.name), ['山东-济南', '山东-菏泽'])
+    assert.deepEqual(groups[1].dataList.map(channel => channel.name), ['菏泽一套', '菏泽二套', '牡丹区新闻综合', '定陶综合'])
+  })
+
+  check('抓取失败时沿用上一轮频道——频道不能静默从播放列表消失', () => {
+    const manager = newManager()
+    manager.setModuleEnabled('bilibili-live', true)
+    seed(manager, oneGroup, { status: 'failed', consecutiveFailures: 3, lastError: '风控' })
+    const groups = manager.getValidChannels()
+    assert.equal(groups.length, 1)
+    assert.equal(groups[0].dataList.length, 1, '全局的 0 频道守卫只看总数，护不住单个模块')
+    const moduleState = manager.getState().modules.find(module => module.id === 'bilibili-live')
+    assert.equal(moduleState.health.usingCachedChannels, true,
+      '面板必须说明失败时的频道数来自上一轮缓存')
+  })
+
+  check('详情弹窗的频道名单：按分组只给名字，关掉模块后仍保留（issue #164）', () => {
+    const manager = newManager()
+    seed(manager, [...oneGroup, { name: '空组', dataList: [] }])
+    manager.setModuleEnabled('bilibili-live', false)
+    const moduleState = manager.getState().modules.find(module => module.id === 'bilibili-live')
+    assert.deepEqual(moduleState.channelGroups, [{ name: '赛事', channels: ['[原画] 主播'] }],
+      '只回名字（不带地址），空分组不列')
+    assert.deepEqual(newManager().getState().modules.find(module => module.id === 'bilibili-live').channelGroups, [],
+      '没抓到过就是空数组')
+  })
+
+  check('首次抓取失败且无缓存时，面板不得误报沿用缓存', () => {
+    const manager = newManager()
+    seed(manager, [], { status: 'failed', consecutiveFailures: 1, lastError: 'HTTP 403', channelCount: 0 })
+    const moduleState = manager.getState().modules.find(module => module.id === 'bilibili-live')
+    assert.equal(moduleState.health.usingCachedChannels, false)
+  })
+
+  check('只放内存的模块重启后列表为空：面板频道数按实际缓存算，不沿用落盘的旧数', () => {
+    const manager = newManager()
+    // 咪咕 groups 不落盘、health 落盘：重启后就是「groups 空 + channelCount 还是上一轮」
+    manager.cache.modules.migu = {
+      groups: [],
+      health: { ...emptyHealth(), status: 'failed', consecutiveFailures: 238, lastError: '咪咕分类接口无响应', channelCount: 83 },
+      memoryOnly: true,
+    }
+    const health = manager.getState().modules.find(module => module.id === 'migu').health
+    assert.equal(health.channelCount, 0, '列表是空的，卡片不能写「83 频道」')
+    assert.equal(health.usingCachedChannels, false)
+    assert.equal(manager.alertSnapshot().modules.find(module => module.id === 'migu').health.channelCount, 0)
+  })
+
+  // 「抓取模块总开关」已退休：旧关闭态只负责升级迁移，运行时不能再覆盖卡片选择。
+  // 这条钉住「模块开关就是唯一真相」，防将来有人
+  // 看到 config.js 里还留着 enableExtractors 就顺手把那道闸加回 isModuleEnabled。
+  check('★ 模块开关是唯一真相：打开后必须出频道，不受任何外层开关否决', () => {
+    const manager = newManager()
+    manager.setModuleEnabled('bilibili-live', true)
+    seed(manager, oneGroup)
+    assert.equal(manager.getValidChannels().length, 1,
+      '模块开关打开却没出频道 —— 是不是又加了一道外层总开关？')
+    // getState 不该再回传总开关字段：前端据此画过一个顶在卡片上方、却管不到咪咕的开关
+    assert.equal('enabled' in manager.getState(), false,
+      'getState 不该再有 enabled（总开关）字段')
+  })
+
+  check('模块级开关关掉后不出频道', () => {
+    const manager = newManager()
+    manager.setModuleEnabled('bilibili-live', true)
+    seed(manager, oneGroup)
+    assert.equal(manager.getValidChannels().length, 1)
+
+    manager.setModuleEnabled('bilibili-live', false)
+    assert.deepEqual(manager.getValidChannels(), [], '模块级开关关掉后不该出频道')
+  })
+
+  // 以下用例一律带 onlyId：注册表里还有咪咕，不限定的话 updateAll 会去抓真实的
+  // 咪咕接口——测试不该联网，也不该受它成败影响。
+  await checkAsync('禁用的模块不参与抓取', async () => {
+    const manager = newManager()
+    manager.setModuleEnabled('bilibili-live', false)
+    const result = await manager.updateAll({ forceAll: true, onlyId: 'bilibili-live' })
+    assert.deepEqual(result.results, [])
+  })
+
+  await checkAsync('房间清单空 + 自动抓取关闭：成功但 0 频道，且不联网', async () => {
+    // 多选分区至少保留一个；关闭自动抓取由 topPerArea=0 明确表达。默认分区仍在，
+    // 但数量为 0 时不会发起热门榜请求。
+    const manager = newManager()
+    manager.setModuleEnabled('bilibili-live', true)
+    manager.updateModuleConfig('bilibili-live', { rooms: '', topPerArea: 0 })
+    const result = await manager.updateAll({ forceAll: true, onlyId: 'bilibili-live' })
+    assert.equal(result.results[0].success, true)
+    const state = manager.getState()
+    const module = state.modules.find(m => m.id === 'bilibili-live')
+    assert.equal(module.health.status, 'empty', '0 频道是「没人播」不是「失败」')
+    assert.ok(module.health.warnings.some(w => w.includes('房间号')))
+  })
+
+  check('配置损坏时拒绝写盘，不把用户配置覆盖成空', () => {
+    const badDir = mkdtempSync(join(tmpdir(), 'iptv-extractors-corrupt-'))
+    const badPath = join(badDir, 'extractors.json')
+    writeFileSync(badPath, '{ 这不是合法 JSON')
+    const manager = new ExtractorManager()
+    manager.configPath = badPath
+    manager.cachePath = join(badDir, 'extractor-cache.json')
+    manager.load()
+
+    assert.ok(manager.corrupt, '应当置位损坏标记')
+    assert.ok(existsSync(`${badPath}.corrupt`), '应当另存一份原文件')
+    assert.throws(() => manager.setModuleEnabled('bilibili-live', false), /损坏/)
+    assert.ok(readFileSync(badPath, 'utf-8').includes('这不是合法 JSON'), '原文件必须原样保留')
+    rmSync(badDir, { recursive: true, force: true })
+  })
+
+  check('改配置后立刻到期重抓，而不是等到原定刷新点', () => {
+    const manager = newManager()
+    manager.setModuleEnabled('bilibili-live', true)
+    seed(manager, oneGroup)
+    manager.updateModuleConfig('bilibili-live', { rooms: '13' })
+    const module = manager.getState().modules.find(m => m.id === 'bilibili-live')
+    assert.equal(module.health.lastSuccessAt, null, '配置变了，上一轮结果不再代表当前配置')
+  })
+
+  await checkAsync('内置频道表升级后启动即重建旧缓存，成功才记录新版本', async () => {
+    const oldUpdatedAt = Date.now()
+    const manager = newManager(undefined, undefined, {
+      modules: {
+        yangshipin: {
+          groups: [{ name: '央视频', dataList: [{ name: '旧缓存频道', deferredRef: 'ysp-cctv1' }] }],
+          health: { ...emptyHealth(), status: 'ok', lastSuccessAt: oldUpdatedAt, channelCount: 1 },
+        },
+      },
+    })
+    assert.equal(manager.cache.modules.yangshipin.health.lastSuccessAt, null,
+      '缺少 catalogVersion 的旧缓存要立即到期')
+    // 其余新模块也没有缓存；标为本进程已尝试，隔离本用例并避免真实网络请求。
+    for (const module of listModules()) {
+      if (module.id !== 'yangshipin') manager.attempted.add(module.id)
+    }
+    const result = await manager.ensureWarm()
+    assert.equal(result.results.length, 1)
+    assert.equal(result.results[0].id, 'yangshipin')
+    assert.equal(result.results[0].success, true)
+    const channels = manager.cache.modules.yangshipin.groups.flatMap(group => group.dataList || [])
+    assert.equal(channels.length, 73, '升级后应立即生成 63 个公开台 + 10 个 VIP 台')
+    assert.equal(manager.cache.modules.yangshipin.catalogVersion, getModule('yangshipin').catalogVersion)
+    const onDisk = JSON.parse(readFileSync(manager.cachePath, 'utf8'))
+    assert.equal(onDisk.modules.yangshipin.catalogVersion, getModule('yangshipin').catalogVersion,
+      '成功重建后版本要持久化，避免每次重启重复抓取')
+  })
+
+  check('向后兼容：老版本写的「全量 key」配置里，空串不该挡住 env 兜底', () => {
+    // 改稀疏存储之前，磁盘上存的是 sessdata:"" 这种「配过但是空」的条目。
+    // 老代码 env 兜底用真值判断（空串回落 env），新代码用「键存不存在」——
+    // 不归一的话，设了 mbiliSessdata 又存过一次配置的用户 env 会突然失效。
+    const manager = newManager()
+    manager.config.modules['bilibili-live'] = {
+      enabled: true,
+      config: { rooms: '13', sessdata: '', preferHls: true, preferAvc: true, cachingMs: 3000, minOnline: 3000 },
+    }
+    const saved = process.env.mbiliSessdata
+    try {
+      process.env.mbiliSessdata = 'FROM_ENV'
+      const cfg = manager.effectiveConfig(getModule('bilibili-live'))
+      assert.equal(cfg.sessdata, 'FROM_ENV', '老配置里的空串要被归一掉，让 env 接手')
+      assert.equal(cfg.rooms, '13', '有值的字段保持不变')
+      assert.equal(cfg.minOnline, 3000, 'int 不做归一，保留成「配过」')
+      assert.equal(cfg.cachingMs, undefined, '已下线的直链时代字段（preferHls / cachingMs）不再进生效配置')
+      assert.equal(cfg.preferHls, undefined)
+    } finally {
+      if (saved === undefined) delete process.env.mbiliSessdata
+      else process.env.mbiliSessdata = saved
+    }
+  })
+
+  check('deferredRef 原样透传，供写盘落成 ${replace}/<ref>', () => {
+    // 延迟解析模块（咪咕将来就是这个形态）产出 ref 而不是 url。
+    // ref 必须保持单个路径段：buildChannelId 用 /^\$\{replace\}\/([^/?#]+)/ 取
+    // 频道主键，多段会失配、让老用户的「我的频道」配置一次性作废。
+    const manager = newManager()
+    manager.setModuleEnabled('bilibili-live', true)
+    seed(manager, [{ name: 'G', dataList: [{ name: 'CCTV1', deferredRef: 608807420 }] }])
+    const [channel] = manager.getValidChannels()[0].dataList
+    assert.equal(channel.deferredRef, '608807420', '数字要归一成字符串')
+    assert.ok(!channel.deferredRef.includes('/'), 'ref 不能含斜杠')
+  })
+
+  check('cache:disk 的模块：结果与健康状态都落盘', () => {
+    // cache:'memory' 的分支目前没有模块声明（咪咕收编时才会用到），故此处未覆盖。
+    const manager = newManager()
+    manager.setModuleEnabled('bilibili-live', true)
+    seed(manager, oneGroup)
+    manager.updateModuleConfig('bilibili-live', { rooms: '13' })   // 这条会写缓存
+    const onDisk = JSON.parse(readFileSync(manager.cachePath, 'utf-8'))
+    // bilibili-live 声明的是 cache:'disk'，所以这里应当落盘
+    assert.ok(onDisk.modules['bilibili-live'].groups.length > 0, 'disk 模块的结果要落盘')
+    assert.ok(onDisk.modules['bilibili-live'].health, '健康状态要落盘')
+  })
+
+  await checkAsync('冷缓存兜底看「本进程抓过没」，不看「历史上成功过没」', async () => {
+    // 回归：曾用 !health.lastSuccessAt 做判据。而 cache:'memory' 的模块 groups 不落盘、
+    // health 落盘，重启后就是「groups 空 + lastSuccessAt 有值」，那个判据会把真正需要
+    // 兜底的场景整个挡掉——实测设了 updateOnStartup=false 的用户重启后一次重生成，
+    // 175 条咪咕频道整批从播放列表消失。
+    const manager = newManager()
+    manager.setModuleEnabled('bilibili-live', true)
+    manager.updateModuleConfig('bilibili-live', { rooms: '', topPerArea: 0 }) // 空清单 = 不联网
+    // 默认开启后其余模块也是冷缓存；本用例只测 B 站，标成已尝试以隔离真实网络。
+    for (const module of listModules()) {
+      if (module.id !== 'bilibili-live') manager.attempted.add(module.id)
+    }
+    // 模拟「上次成功过、但本进程 groups 是空的」
+    manager.cache.modules['bilibili-live'] = {
+      groups: [], health: { ...emptyHealth(), status: 'ok', lastSuccessAt: Date.now() },
+    }
+    const first = await manager.ensureWarm()
+    assert.ok(first.results.some(r => r.id === 'bilibili-live'), '有过成功记录也要兜底抓一次')
+
+    // 抓过之后即便结果是 0 条（房间全没开播是合法的空），不该反复重抓
+    const second = await manager.ensureWarm()
+    assert.deepEqual(second.results, [], '本进程已抓过就不再重复兜底')
+  })
+
+  check('critical 模块一条频道都没有时会被报出来，供写盘守卫拦截', () => {
+    // 回归：收编前咪咕现抓失败会让 getAllChannels 返回空 → 全局 0 频道守卫触发 →
+    // 一个字节都不写。收编后失败被吞在模块内，而外部源几十条就能把总数撑起来，
+    // 守卫失效 → 播放列表被重写成没有咪咕的版本（实测 484 条 → 0 条）。
+    // 那份保护本来是靠「咪咕失败 = 全局 0 条」的巧合得来的，现在改成显式声明。
+    const manager = newManager()
+    // 带 sourceId 返回：写盘守卫要用它去现有播放列表里查这个源在不在（issue #129）
+    assert.deepEqual(manager.criticalShortfall(), [{ id: 'migu', name: '咪咕视频', sourceId: 'migu' }], '缓存为空时必须报出来')
+
+    // 有频道了就不该再报
+    manager.cache.modules['migu'] = {
+      groups: [{ name: '央视', dataList: [{ name: 'CCTV1', deferredRef: '1' }] }],
+      health: { ...emptyHealth(), status: 'ok', lastSuccessAt: Date.now() },
+    }
+    assert.deepEqual(manager.criticalShortfall(), [])
+  })
+
+  check('非 critical 模块拿不到频道不触发守卫（房间全没开播是合法的空）', () => {
+    const manager = newManager()
+    manager.setModuleEnabled('bilibili-live', true)
+    manager.cache.modules['migu'] = {
+      groups: [{ name: '央视', dataList: [{ name: 'CCTV1', deferredRef: '1' }] }],
+      health: { ...emptyHealth(), status: 'ok', lastSuccessAt: Date.now() },
+    }
+    // bilibili-live 没有 critical，0 条频道不该让整份播放列表停止生成
+    assert.deepEqual(manager.criticalShortfall(), [])
+  })
+
+  check('刷新间隔默认取模块声明值；B 站地址改为播放时现换，周期只管房间名单，区间与虎牙对齐', () => {
+    const manager = newManager()
+    const module = manager.getState().modules.find(m => m.id === 'bilibili-live')
+    assert.equal(module.refreshMinutes, 45)
+    assert.equal(module.minRefreshMinutes, 15)
+    assert.equal(module.maxRefreshMinutes, 120)
+  })
+
+  check('B 站刷新间隔只允许 15~120 分钟，历史越界值回落默认', () => {
+    const manager = newManager()
+    assert.throws(() => manager.updateModuleConfig('bilibili-live', {}, { refreshMinutes: 14 }), /15~120/)
+    assert.throws(() => manager.updateModuleConfig('bilibili-live', {}, { refreshMinutes: 121 }), /15~120/)
+    manager.updateModuleConfig('bilibili-live', {}, { refreshMinutes: 120 })
+    assert.equal(manager.getState().modules.find(m => m.id === 'bilibili-live').refreshMinutes, 120)
+    // 直链时代存过的 90 仍在区间内，升级后不回落
+    manager.config.modules['bilibili-live'].refreshMinutes = 90
+    assert.equal(manager.getState().modules.find(m => m.id === 'bilibili-live').refreshMinutes, 90)
+    manager.config.modules['bilibili-live'].refreshMinutes = 10
+    assert.equal(manager.getState().modules.find(m => m.id === 'bilibili-live').refreshMinutes, 45)
+  })
+
+  check('自动刷新模块忽略历史覆盖值，且拒绝继续手动修改', () => {
+    const manager = newManager()
+    manager.getState() // 先让管理器按注册表建立各模块的稀疏配置项
+    manager.config.modules.gxtv.refreshMinutes = 999
+    manager.config.modules.cztv.refreshMinutes = 999
+    const modules = manager.getState().modules
+    const gxtv = modules.find(m => m.id === 'gxtv')
+    const cztv = modules.find(m => m.id === 'cztv')
+    assert.equal(gxtv.refreshMinutes, 30)
+    assert.equal(cztv.refreshMinutes, 240)
+    assert.equal(gxtv.refreshConfigurable, false)
+    assert.match(cztv.refreshDescription, /播放签名约 5 分钟/)
+    assert.throws(
+      () => manager.updateModuleConfig('gxtv', {}, { refreshMinutes: 60 }),
+      /自动管理/,
+    )
+  })
+
+  check('未知模块 id 被拒绝', () => {
+    const manager = newManager()
+    assert.throws(() => manager.setModuleEnabled('不存在', true), /未知的抓取模块/)
+    assert.throws(() => manager.updateModuleConfig('不存在', {}), /未知的抓取模块/)
+  })
+
+  await checkAsync('★ 同一模块的并发抓取合并为一份在飞（tick / 立即刷新 / 启动抓取互撞）', async () => {
+    // 回归：三条触发路径互不知情，后台「立即刷新」还是 fire-and-forget、可连点。
+    // 撞在一起就是对同一平台瞬时并发翻倍——B 站为防 -352 风控特意把模块内并发
+    // 压到 3 路，两轮并行等于 6 路；且两轮的成败会互相覆盖健康状态。
+    const manager = newManager()
+    manager.setModuleEnabled('bilibili-live', true)
+    const module = getModule('bilibili-live')
+    const origFetch = module.fetch
+    let calls = 0
+    module.fetch = async () => { calls++; await new Promise(r => setTimeout(r, 30)); return { groups: oneGroup } }
+    try {
+      await Promise.all([
+        manager.updateAll({ onlyId: 'bilibili-live' }),
+        manager.updateAll({ onlyId: 'bilibili-live' }),
+      ])
+    } finally { module.fetch = origFetch }
+    assert.equal(calls, 1, '在飞的必须复用同一份，不能对平台翻倍并发')
+  })
+
+  await checkAsync('★ 在飞轮跑的是旧配置时，「立即刷新」串行补跑一轮新配置，不复用旧轮', async () => {
+    // 回归（对抗审查抓到的）：无脑复用在飞轮的话，「保存配置 → 点立即刷新」拿到的
+    // 是旧配置那轮的结果，且旧轮完成时的记账会把 updateModuleConfig 置下的
+    // 「立刻重抓」信号抹掉——刚扫码写入的 SESSDATA 要等满 45 分钟才生效。
+    const manager = newManager()
+    manager.setModuleEnabled('bilibili-live', true)
+    const module = getModule('bilibili-live')
+    const origFetch = module.fetch
+    const seenRooms = []
+    let release
+    const gate = new Promise(r => { release = r })
+    module.fetch = async (config) => { seenRooms.push(config.rooms); await gate; return { groups: oneGroup } }
+    try {
+      const first = manager.updateAll({ onlyId: 'bilibili-live' })    // 旧配置在飞
+      await new Promise(r => setTimeout(r, 10))
+      manager.updateModuleConfig('bilibili-live', { rooms: '999' })   // 保存新配置
+      const second = manager.updateAll({ onlyId: 'bilibili-live' })   // 立即刷新
+      release()
+      await Promise.all([first, second])
+    } finally { module.fetch = origFetch }
+    assert.equal(seenRooms.length, 2, '配置变了必须补跑一轮，不能吞掉强制刷新')
+    assert.equal(seenRooms[1], '999', '补跑那轮用的必须是新配置')
+  })
+
+  await checkAsync('★ 在飞轮跑到一半配置变了：记账不得抹掉「立刻重抓」信号', async () => {
+    // 同一回归的 tick 路径：没有人点「立即刷新」，只是保存了配置。在飞旧轮完成时
+    // recordSuccess 整份重建 health，若把 lastSuccessAt 写回非 null，下一轮 5 分钟
+    // tick 就不会重抓，新配置要等满整个刷新周期。
+    const manager = newManager()
+    manager.setModuleEnabled('bilibili-live', true)
+    const module = getModule('bilibili-live')
+    const origFetch = module.fetch
+    let release
+    const gate = new Promise(r => { release = r })
+    module.fetch = async () => { await gate; return { groups: oneGroup } }
+    try {
+      const round = manager.updateAll({ onlyId: 'bilibili-live' })
+      await new Promise(r => setTimeout(r, 10))
+      manager.updateModuleConfig('bilibili-live', { rooms: '999' })
+      release()
+      await round
+    } finally { module.fetch = origFetch }
+    const health = manager.cache.modules['bilibili-live'].health
+    assert.equal(health.lastSuccessAt, null, '旧轮的记账不能冻结「配置已变更、立刻重抓」')
+  })
+
+  await checkAsync('★ 频道表和上一轮一样 → changed:false，变了 → changed:true（issue #222）', async () => {
+    // 回归：5 分钟 tick 此前只看「刷新成功」就重写播放列表。延迟解析的模块（广西每 30 分钟）
+    // 每轮抓回的都是同一份 deferredRef，等于反复重写一字未变的列表、刷五十多行日志。
+    const manager = newManager()
+    manager.setModuleEnabled('bilibili-live', true)
+    const module = getModule('bilibili-live')
+    const origFetch = module.fetch
+    let groups = oneGroup
+    // 每轮都给新对象：真实模块每次都是现拼的，判定必须比内容、不能比引用
+    module.fetch = async () => ({ groups: JSON.parse(JSON.stringify(groups)) })
+    const run = async (m = manager) => (await m.updateAll({ forceAll: true, onlyId: 'bilibili-live' })).results[0]
+    try {
+      assert.equal((await run()).changed, true, '冷缓存第一次抓到频道就是变化')
+      const same = await run()
+      assert.equal(same.success, true)
+      assert.equal(same.changed, false, '内容没变不该触发重新生成')
+
+      // 重启后磁盘缓存 JSON 往返一次，再抓到同样内容也还是没变
+      const restarted = new ExtractorManager()
+      restarted.configPath = manager.configPath
+      restarted.cachePath = manager.cachePath
+      restarted.legacyConfigPath = manager.legacyConfigPath
+      restarted.load()
+      assert.equal((await run(restarted)).changed, false, '读回磁盘缓存后比对不该失真')
+
+      groups = [{ ...oneGroup[0], dataList: [{ ...oneGroup[0].dataList[0], url: 'https://cdn/b.m3u8' }] }]
+      assert.equal((await run()).changed, true, '地址变了必须重新生成')
+    } finally { module.fetch = origFetch }
+  })
+
+  check('listSourceIds 不按模块开关过滤——「配置档 ↔ 源」的绑定行要留在矩阵里', () => {
+    // 回归：按 isModuleEnabled 过滤的话，关掉模块后它的绑定行从矩阵消失，开回来
+    // 得重设一遍（app.js /api/source-profiles 的注释明确要求「绑定关系要留着」）。
+    const manager = newManager()
+    manager.setModuleEnabled('bilibili-live', false)
+    const ids = manager.listSourceIds().map(s => s.id)
+    assert.ok(ids.includes('xt:bilibili-live'), '关着的模块也要列出')
+    assert.ok(ids.includes('migu'), '代理开关模块以字面量 id 列出，且只此一份（app.js 不再单列）')
+  })
+} finally {
+  rmSync(tmp, { recursive: true, force: true })
+}
+
+// ---- 热门直播间自动加入（省去用户自己找房间号）----
+// 存在的理由：不这么做的话，想用 B 站直播就得先去网页上一个个找房间号，那是这个
+// 模块最劝退的一步。默认「赛事 + 知识」兼顾官方比赛与新闻 / 教育 / 科普，适合
+// 电视端长时间观看；所有结果仍统一进一个 B站 组。
+
+check('分区名解析：一行一个、去空白、忽略空行与 # 注释', () => {
+  assert.deepEqual(parseAreaNames('赛事\n  网游  \n\n# 这行是注释\n手游'), ['赛事', '网游', '手游'])
+  assert.deepEqual(parseAreaNames(''), [])
+  assert.deepEqual(parseAreaNames(null), [])
+  assert.deepEqual(parseAreaNames('# 全是注释\n\n'), [])
+})
+
+check('★ 手填清单排在热门榜之前', () => {
+  // 顺序不只是好看：它决定同名频道在播放器「源1 / 源2」里的先后，
+  // 用户明确指定的那个应该是源1
+  assert.deepEqual(mergeRoomRefs([111, 222], [333, 444]), [111, 222, 333, 444])
+})
+
+check('★ 手填的房间正好在热门榜里时只出现一次', () => {
+  // 不去重的话同一个直播间会在播放列表里出现两次：同名、同地址，纯噪音
+  assert.deepEqual(mergeRoomRefs([111, 222], [222, 333]), [111, 222, 333])
+})
+
+check('去重按字符串形式，数字 222 与字符串 "222" 视为同一个房间', () => {
+  // parseRoomList 产出的可能是字符串（用户粘的地址），热门榜产出的是数字
+  assert.deepEqual(mergeRoomRefs(['222'], [222, 333]), ['222', 333])
+})
+
+check('空输入不炸', () => {
+  assert.deepEqual(mergeRoomRefs([], []), [])
+  assert.deepEqual(mergeRoomRefs(null, undefined), [])
+})
+
+check('★ B 站不同分区统一归入「B站」组，且真实房间号仍去重', () => {
+  const warnings = []
+  const groups = groupBilibiliResults([
+    { roomId: '1', group: '赛事', channel: { name: '赛事 A', groupTitle: '赛事' } },
+    { roomId: '2', group: '娱乐', channel: { name: '娱乐 B', groupTitle: '娱乐' }, warning: '装饰信息缺失' },
+    { roomId: '1', group: '网游', channel: { name: '重复房间', groupTitle: '网游' } },
+  ], warnings)
+  assert.equal(BILIBILI_GROUP, 'B站')
+  assert.deepEqual(groups, [{
+    name: 'B站',
+    dataList: [
+      { name: '赛事 A', groupTitle: 'B站' },
+      { name: '娱乐 B', groupTitle: 'B站' },
+    ],
+  }])
+  assert.deepEqual(warnings, ['装饰信息缺失'])
+})
+
+check('★ 热门榜滤掉人气过低的房间（否则同一场比赛的多机位小号会灌进播放列表）', () => {
+  // 实测赛事区 13 名往后全是「王者荣耀赛事第一视角7/9/3…」这种同场比赛的不同机位，
+  // 人气普遍在 1000 上下。删掉过滤那行不会有任何报错，只是播放列表悄悄变脏。
+  const raw = [
+    { roomid: 1, online: 3_000_000 },   // 真赛事
+    { roomid: 2, online: 150_000 },     // 真赛事
+    { roomid: 3, online: 11_000 },      // 小众但真实（羽毛球世锦赛量级）
+    { roomid: 4, online: 1_836 },       // 「第一视角7」这类
+    { roomid: 5, online: 163 },
+  ]
+  assert.deepEqual(selectTopRooms(raw, 10), [1, 2, 3], '默认门槛以下的必须滤掉')
+})
+
+check('热门榜最低人气可配置，0 表示不过滤', () => {
+  const raw = [
+    { roomid: 1, online: 11_000 },
+    { roomid: 2, online: 3_000 },
+    { roomid: 3, online: 1_500 },
+  ]
+  assert.deepEqual(selectTopRooms(raw, 10, 10_000), [1], '可收紧到旧门槛')
+  assert.deepEqual(selectTopRooms(raw, 10, 1_000), [1, 2, 3], '可放宽门槛')
+  assert.deepEqual(selectTopRooms(raw, 10, 0), [1, 2, 3], '0 应关闭人气过滤')
+})
+
+check('数量是上限不是保证：够格的不足就给不足', () => {
+  const raw = [{ roomid: 1, online: 3_000_000 }, { roomid: 2, online: 500 }]
+  assert.deepEqual(selectTopRooms(raw, 8), [1], '只有 1 个够格就只给 1 个，不凑数')
+})
+
+check('截断按数量生效，且保持人气从高到低的原序', () => {
+  const raw = [1, 2, 3, 4].map((id, i) => ({ roomid: id, online: 1_000_000 - i * 1000 }))
+  assert.deepEqual(selectTopRooms(raw, 2), [1, 2])
+})
+
+check('脏数据不炸：非数组 / 缺字段 / 房间号非法', () => {
+  assert.deepEqual(selectTopRooms(null, 5), [])
+  assert.deepEqual(selectTopRooms(undefined, 5), [])
+  assert.deepEqual(selectTopRooms([{}, { online: 999999 }, { roomid: 0, online: 999999 }], 5), [])
+  assert.deepEqual(selectTopRooms([{ roomid: 7, online: 999999 }], 0), [], 'count=0 等于关掉')
+})
+
+check('热门榜配置已进 configSchema 且默认值符合「开箱即用」', () => {
+  const schema = bili.configSchema
+  const areas = schema.find(f => f.key === 'topAreas')
+  const per = schema.find(f => f.key === 'topPerArea')
+  const minOnline = schema.find(f => f.key === 'minOnline')
+  assert.ok(areas, 'topAreas 字段丢了')
+  assert.ok(per, 'topPerArea 字段丢了')
+  assert.ok(minOnline, 'minOnline 字段丢了')
+  assert.equal(areas.type, 'multiselect', '分区应直接勾选，不再依赖用户读说明后手填')
+  assert.deepEqual(areas.options.map(option => option.value), [
+    '赛事', '知识', '生活', '网游', '手游', '单机游戏',
+    '娱乐', '电台', '虚拟主播', '聊天室', '互动玩法', '购物',
+  ])
+  assert.equal(areas.default, '赛事\n知识', '默认分区应兼顾赛事与适合电视端的知识内容')
+  assert.deepEqual(parseAreaNames(areas.default), ['赛事', '知识'])
+  assert.equal(per.default, 8, "实测赛事区人气在第 6~7 名有 82% 断崖，5 会漏掉 300 万人在看的比赛")
+  assert.equal(per.min, 0, '填 0 必须能关掉这个功能')
+  assert.equal(minOnline.default, DEFAULT_MIN_ONLINE)
+  assert.equal(minOnline.default, 3000, '默认应兼顾正常赛事与低热度重复机位')
+  assert.equal(minOnline.min, 0, '填 0 必须能关闭人气过滤')
+})
+
+check('★ 咪咕：分类全失败判失败保缓存，部分失败/真没频道不误伤', () => {
+  // 与 B 站 shouldFailRound 同一套约定。全失败当成功返回的话：空结果覆盖上一轮
+  // 内存缓存、无退避、criticalShortfall 把所有播放列表重生成挡到下个刷新周期。
+  assert.equal(miguShouldFailRound(0, 11), true, '一个频道都没有且确有分类失败 → 判失败')
+  assert.equal(miguShouldFailRound(0, 0), false, '接口正常但真没频道 → 如实返回（不太可能但不该误判）')
+  assert.equal(miguShouldFailRound(500, 2), false, '部分分类失败不算整轮失败，记 meta.warnings')
+})
+
+await checkAsync('★ B 站：热门榜获取失败且无手填 → 整轮判失败（保上一轮缓存），不再是「成功 0 频道」', async () => {
+  // 回归：默认配置正是纯热门榜（topAreas=赛事、rooms 留空）。分区清单/热门榜的
+  // 网络层失败此前被吞成 warning、fetch() 返回空 groups——被记成「成功 0 频道」，
+  // 上一轮频道被覆盖成空且不退避。timeoutMs=1 模拟断网：现在必须抛。
+  const config = resolveConfig(bili, {})
+  await assert.rejects(() => bili.fetch(config, { timeoutMs: 1 }), /失败/)
+})
+
+await checkAsync('B 站：手填房间没开播也列出「主播 · 未开播」；只剩占位又有真出错时整轮判失败', async () => {
+  const rooms = {
+    5440: { room_id: 5440, uid: 9, title: '上一场的标题', live_status: 0 },
+    21144080: { room_id: 21144080, uid: 7, title: 'KPL 总决赛', live_status: 1 },
+  }
+  const anchors = { 9: { uname: '离线主播', face: 'https://i0.hdslb.com/off.jpg' }, 7: { uname: '哔哩哔哩赛事', face: 'https://i0.hdslb.com/face.jpg' } }
+  const { fetchImpl: liveFixture } = biliApiFixture()
+  const fetchImpl = async (raw, init) => {
+    const url = new URL(String(raw))
+    if (url.pathname === '/room/v1/Room/get_info') return { ok: true, status: 200, json: async () => ({ code: 0, data: rooms[url.searchParams.get('room_id')] }) }
+    if (url.pathname === '/live_user/v1/Master/info') return { ok: true, status: 200, json: async () => ({ code: 0, data: { info: anchors[url.searchParams.get('uid')] } }) }
+    return liveFixture(raw, init)
+  }
+  const fetched = await bili.fetch(resolveConfig(bili, { rooms: '5440\n21144080', topAreas: '' }), { fetchImpl })
+  assert.deepEqual(fetched.groups[0].dataList.map(c => [c.deferredRef, c.name, c.logo, c.relayHls]), [
+    ['bili-5440', '离线主播 · 未开播', 'https://i0.hdslb.com/off.jpg', true],
+    ['bili-21144080', '[超清] 哔哩哔哩赛事 · KPL 总决赛', 'https://i0.hdslb.com/face.jpg', true],
+  ])
+  // 热门榜挂了、手填的又都没开播：整轮判失败保上一轮缓存（热门榜频道不能被冲掉）
+  const roomApis = ['/room/v1/Room/get_info', '/live_user/v1/Master/info']
+  const failing = async (raw, init) => roomApis.includes(new URL(String(raw)).pathname)
+    ? fetchImpl(raw, init) : Promise.reject(new Error('connect refused'))
+  await assert.rejects(bili.fetch(resolveConfig(bili, { rooms: '5440' }), { fetchImpl: failing }), /本轮无一成功/)
+})
+
+await checkAsync('B 站：刷新时检查登录态，失效进提醒中心但频道照抓；网络失败不冤枉登录态', async () => {
+  // 乱填、过期的 SESSDATA 实测回 code -101「账号未登录」（2026-10-06）
+  const navReply = body => async (url, options) => {
+    assert.equal(String(url), 'https://api.bilibili.com/x/web-interface/nav')
+    assert.equal(options.headers.Cookie, 'SESSDATA=abc')
+    return typeof body === 'function' ? body() : Response.json(body)
+  }
+  assert.deepEqual(await checkBiliLogin('', { fetchImpl: () => assert.fail('没配登录态不该发请求') }), {})
+  assert.deepEqual(await checkBiliLogin('SESSDATA=abc', { fetchImpl: navReply({ code: 0, data: { isLogin: true } }) }), {})
+  assert.deepEqual(await checkBiliLogin('SESSDATA=abc', { fetchImpl: navReply({ code: -101, message: '账号未登录', data: { isLogin: false } }) }),
+    { rejected: SESSDATA_REJECTED_NOTICE })
+  assert.match((await checkBiliLogin('SESSDATA=abc', { fetchImpl: navReply(() => new Response('', { status: 502 })) })).warning, /检查没有完成：HTTP 502/)
+  // 生产默认是 node-fetch：body 是 Node 流、没有 cancel()，风控 412 时也要报出状态码
+  const nodeStream = { ok: false, status: 412, body: Readable.from([]) }
+  assert.match((await checkBiliLogin('SESSDATA=abc', { fetchImpl: navReply(() => nodeStream) })).warning, /检查没有完成：HTTP 412/)
+  assert.match((await checkBiliLogin('SESSDATA=abc', { fetchImpl: navReply(() => { throw new Error('connect refused') }) })).warning, /检查没有完成：connect refused/)
+  assert.match(SESSDATA_REJECTED_NOTICE, /超清/)
+
+  // 模块 fetch 把结论交给 meta.credentialRejected：一间房都没配时也照样报
+  const config = resolveConfig(bili, { sessdata: 'abc', topAreas: '', rooms: '' })
+  const fetched = await bili.fetch(config, { fetchImpl: navReply({ code: -101, data: { isLogin: false } }) })
+  assert.equal(fetched.meta.credentialRejected, SESSDATA_REJECTED_NOTICE)
+})
+
+// ---- 虎牙直播 ----
+
+const huyaEventHtml = `
+<ul><li class="game-live-item match-live-item" data-gid="1">
+  <a href="https://www.huya.com/660101" class="video-info clickstat">
+    <img class="pic" data-original="//img.example/live.jpg?a=1&amp;b=2" alt="主播的直播">
+  </a>
+  <a href="https://www.huya.com/660101" class="title" title="决赛 &amp; 颁奖">决赛</a>
+  <i class="nick" title="赛事官方">赛事官方</i>
+  <i class="js-num">1.2万</i>
+</li></ul>`
+
+const huyaAntiCode = new URLSearchParams({
+  wsSecret: 'old',
+  wsTime: '6553f100',
+  fm: 'c2FsdF8kMF8kMV8kMl8kMw==',
+  ctype: 'huya_live',
+  fs: 'bgct',
+}).toString()
+
+const huyaPlayerHtml = `
+<script>var hyPlayerConfig = {
+  stream: ${JSON.stringify({
+    data: [{
+      gameLiveInfo: {
+        uid: 123456,
+        profileRoom: 660101,
+        introduction: '虎牙测试直播',
+        nick: '测试主播',
+        screenshot: 'http://img.example/room.jpg',
+        totalCount: 12000,
+      },
+      gameStreamInfoList: [{
+        sStreamName: 'abc',
+        sHlsUrl: 'http://al.hls.huya.com/src',
+        sHlsUrlSuffix: 'm3u8',
+        sHlsAntiCode: huyaAntiCode,
+      }],
+    }],
+    vMultiStreamInfo: [{ iBitRate: 0 }, { iBitRate: 4000 }, { iBitRate: 2000 }, { iBitRate: 500 }],
+  })},
+  other: { nested: true }
+};</script>`
+
+check('虎牙：房间号/地址归一并去重，拒绝外站地址', () => {
+  assert.equal(normalizeHuyaRoom('６６０１０１'), '660101')
+  assert.equal(normalizeHuyaRoom('https://www.huya.com/lpl?from=web'), 'lpl')
+  assert.deepEqual(parseHuyaRoomList('660101\nhttps://www.huya.com/660101\n# 注释\nlpl'), ['660101', 'lpl'])
+  assert.throws(() => normalizeHuyaRoom('https://example.com/660101'), /不是虎牙/)
+})
+
+check('虎牙：赛事卡片解析标题、图片和“万”人气', () => {
+  const rows = parseHuyaEventRooms(huyaEventHtml)
+  assert.equal(rows.length, 1)
+  assert.deepEqual(rows[0], {
+    roomId: '660101',
+    name: '决赛 & 颁奖',
+    nick: '赛事官方',
+    logo: 'https://img.example/live.jpg?a=1&b=2',
+    heat: 12000,
+  })
+})
+
+check('虎牙：普通分类的 ALL_LIST_DATA JSON 可解析并归一频道', () => {
+  const html = `var ALL_LIST_DATA = ${JSON.stringify([{
+    lProfileRoom: 102411,
+    sNick: '神超',
+    sIntroduction: '标题里也可以有 ] 和 }',
+    sScreenshot: 'http://img.example/a.jpg',
+    lTotalCount: 1838540,
+    sGameFullName: '英雄联盟',
+  }])}; var after = true;`
+  const rows = parseHuyaCategoryRooms(html)
+  assert.equal(rows[0].roomId, '102411')
+  assert.equal(rows[0].name, '标题里也可以有 ] 和 }')
+  assert.equal(rows[0].heat, 1838540)
+  assert.equal(rows[0].logo, 'https://img.example/a.jpg')
+})
+
+check('虎牙：播放器配置与画质回落可从房间页稳定提取', () => {
+  const room = parseHuyaRoomPage(huyaPlayerHtml, '660101')
+  assert.equal(room.roomId, '660101')
+  assert.equal(room.presenterUid, '123456')
+  assert.equal(room.logo, 'https://img.example/room.jpg')
+  assert.equal(selectHuyaBitrate(room.bitrates, 2000), 2000)
+  assert.equal(selectHuyaBitrate(room.bitrates, 1000), 500, '缺 1M 时回落到不高于目标的最近档')
+  assert.equal(selectHuyaBitrate(room.bitrates, 0), 0, '0 表示原画')
+})
+
+check('虎牙：赛事房间最高画质取 4K/2K，跳过 HDR，没有高清档时不掉到原画以下', () => {
+  // 10-19 实测 660000 / 660002 的 vMultiStreamInfo；HDR 档（14100 等）HLS 返回 404
+  const esports = [
+    { iBitRate: 20100, iCompatibleFlag: 24576 }, { iBitRate: 20000, iCompatibleFlag: 0 },
+    { iBitRate: 14100, iCompatibleFlag: 24576 }, { iBitRate: 14000, iCompatibleFlag: 0 },
+    { iBitRate: 4200, iCompatibleFlag: 24576 }, { iBitRate: 0 }, { iBitRate: 4000 }, { iBitRate: 2000 }, { iBitRate: 500 },
+  ]
+  const twoK = [{ iBitRate: 0 }, { iBitRate: 14100, iCompatibleFlag: 16384 }, { iBitRate: 14000 }, { iBitRate: 8000 }, { iBitRate: 4000 }]
+  const plain = [{ iBitRate: 0 }, { iBitRate: 8000 }, { iBitRate: 4000 }, { iBitRate: 2000 }]
+  assert.equal(selectHuyaBitrate(esports, 0), 20000, '最高画质取 4K')
+  assert.equal(selectHuyaBitrate(esports, 14000), 14000)
+  assert.equal(selectHuyaBitrate(esports, 4000), 4000, 'HDR 4200 不算')
+  assert.equal(selectHuyaBitrate(twoK, 0), 14000)
+  assert.equal(selectHuyaBitrate(twoK, 20000), 14000, '没有 4K 回落 2K')
+  assert.equal(selectHuyaBitrate(plain, 0), 0, '没有 2K/4K 就是原画')
+  assert.equal(selectHuyaBitrate(plain, 20000), 0, '要 4K 但没有：原画，不掉到 8M')
+})
+
+check('虎牙：官网 H5 签名算法固定样本一致', () => {
+  const room = parseHuyaRoomPage(huyaPlayerHtml, '660101')
+  const signed = new URL(signHuyaHlsUrl(room.streams[0], room.presenterUid, 2000, 1700000000000))
+  assert.equal(signed.protocol, 'https:')
+  assert.equal(signed.pathname, '/src/abc.m3u8')
+  assert.equal(signed.searchParams.get('wsSecret'), '40f4876dcefaa5d837caaf0e35f06997')
+  assert.equal(signed.searchParams.get('seqid'), '1700000000000')
+  assert.equal(signed.searchParams.get('ratio'), '2000')
+  assert.equal(signed.searchParams.get('u'), '123456')
+  assert.equal(signed.searchParams.get('t'), '100')
+  assert.equal(signed.searchParams.get('fm'), null, 'fm 模板不能泄漏到最终播放地址')
+  assert.throws(() => signHuyaHlsUrl({
+    ...room.streams[0],
+    sHlsUrl: 'https://example.com/src',
+  }, room.presenterUid, 2000, 1700000000000), /官方域名/)
+})
+
+check('虎牙：默认配置控制数量与人气，所有频道固定放入虎牙组', () => {
+  const areas = huya.configSchema.find(field => field.key === 'topAreas')
+  assert.equal(areas.type, 'multiselect')
+  assert.deepEqual(areas.options.map(option => option.value), ['赛事', '网游', '手游', '单机', '娱乐', '一起看'])
+  assert.deepEqual(parseHuyaAreaNames(areas.default), ['一起看'], '默认只收核验过的影视正片房间，其他分类由用户自选')
+  assert.equal(huya.configSchema.find(field => field.key === 'topPerArea').default, 8)
+  assert.equal(huya.configSchema.find(field => field.key === 'minHeat').default, DEFAULT_MIN_HEAT)
+  assert.equal(huya.configSchema.find(field => field.key === 'quality').default, 2000)
+  assert.deepEqual(mergeHuyaRooms(
+    [{ roomId: '1', name: '手填' }],
+    [{ roomId: '1', name: '重复' }, { roomId: '2', name: '自动' }],
+  ).map(room => room.name), ['手填', '自动'])
+  assert.equal(HUYA_GROUP, '虎牙')
+})
+
+const huyaTwoLineHtml = `
+<script>var hyPlayerConfig = {
+  stream: ${JSON.stringify({
+    data: [{
+      gameLiveInfo: { uid: 123456, profileRoom: 660101, introduction: '虎牙双线直播', nick: '测试主播' },
+      gameStreamInfoList: [
+        { sCdnType: 'AL', sStreamName: 'abc', sHlsUrl: 'http://al.hls.huya.com/src', sHlsUrlSuffix: 'm3u8', sHlsAntiCode: huyaAntiCode },
+        { sCdnType: 'TX', sStreamName: 'abc', sHlsUrl: 'http://tx.hls.huya.com/src', sHlsUrlSuffix: 'm3u8', sHlsAntiCode: huyaAntiCode },
+        { sCdnType: 'HS', sStreamName: 'abc', sHlsUrl: 'http://hs.hls.huya.com/src', sHlsUrlSuffix: 'm3u8', sHlsAntiCode: huyaAntiCode },
+      ],
+    }],
+    vMultiStreamInfo: [{ iBitRate: 0 }, { iBitRate: 2000 }],
+  })}
+};</script>`
+
+const huyaManifest = '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-TARGETDURATION:4\n#EXTINF:3.0,\nabc_2000-1.ts?x=1\n#EXTINF:3.0,\nabc_2000-2.ts?x=1\n'
+
+// 按主机路由的假上游：房间页回 upstream.html（可中途换）；各线路清单/分片按 rules 回状态码
+// （数组=按次序逐个回、最后一个一直回），并记录请求次数与每次清单请求的地址
+function huyaUpstream(html, rules = {}) {
+  const hits = { page: 0, manifest: {}, segment: {}, manifestUrls: [] }
+  const statusOf = rule => (Array.isArray(rule) ? (rule.length > 1 ? rule.shift() : rule[0]) : rule) ?? 200
+  const upstream = { html, rules, hits }
+  upstream.fetchImpl = async raw => {
+    const url = new URL(String(raw))
+    const respond = (status, text) => ({ ok: status === 200, status, url: url.href, text: async () => text, body: null })
+    if (url.hostname === 'www.huya.com') { hits.page++; return respond(200, upstream.html) }
+    const line = url.hostname.split('.')[0].toUpperCase()
+    if (url.pathname.endsWith('.m3u8')) {
+      hits.manifest[line] = (hits.manifest[line] || 0) + 1
+      hits.manifestUrls.push(url.href)
+      const status = statusOf(upstream.rules[line]?.manifest)
+      return respond(status, status === 200 ? huyaManifest : '<html>403 Forbidden</html>')
+    }
+    hits.segment[line] = (hits.segment[line] || 0) + 1
+    return respond(statusOf(upstream.rules[line]?.segment), '')
+  }
+  return upstream
+}
+
+await checkAsync('虎牙：模块抓取赛事卡片，播放时才刷新签名、取回清单并要求清单中继', async () => {
+  clearHuyaResolveCache()
+  const response = text => ({ ok: true, status: 200, text: async () => text })
+  const config = resolveConfig(huya, { topAreas: '赛事' })
+  const fetched = await huya.fetch(config, { fetchImpl: async url => {
+    assert.equal(String(url), 'https://www.huya.com/m')
+    return response(huyaEventHtml)
+  } })
+  assert.equal(fetched.groups[0].name, '虎牙')
+  assert.equal(fetched.groups[0].dataList[0].deferredRef, 'huya-660101')
+  assert.equal(fetched.groups[0].dataList[0].relayHls, true)
+  assert.equal(fetched.groups[0].dataList[0].opts, undefined, 'LunaTV 导入时 EXTINF 后必须紧跟地址')
+
+  const upstream = huyaUpstream(huyaPlayerHtml)
+  const resolved = await resolveHuyaRoom('huya-660101', { now: 1700000000000, config, fetchImpl: upstream.fetchImpl })
+  assert.match(resolved.url, /^https:\/\/al\.hls\.huya\.com\/src\/abc\.m3u8\?/)
+  assert.equal(resolved.relayHls, true)
+  assert.equal(resolved.upstreamHeaders.Referer, 'https://www.huya.com/')
+  assert.equal(resolved.manifestText, huyaManifest, '清单随结果交回，中继不必再取一次')
+  assert.equal(resolved.manifestUrl, resolved.url)
+  assert.equal(upstream.hits.segment.AL, 1, '新选中的线路先探一片分片')
+
+  const again = await resolveHuyaRoom('huya-660101', { now: 1700000005000, config, fetchImpl: upstream.fetchImpl })
+  assert.equal(again.url, resolved.url, '60 秒内复用同一签名地址')
+  assert.equal(upstream.hits.page, 1, '房间页 60 秒内只取一次')
+  assert.equal(upstream.hits.manifest.AL, 2, '每次播放请求都重新取清单')
+  assert.equal(upstream.hits.segment.AL, 1, '已选中的线路不再逐次探分片')
+})
+
+await checkAsync('虎牙：手填房间没开播也列出「主播 · 未开播」，不存在的房间号照旧跳过；只剩占位又有真出错时整轮判失败', async () => {
+  // 实测（2026-11-04）：未开播页的播放器配置里没有流，主播资料在 TT_PROFILE_INFO；不存在的房间号这份资料是空的
+  const offlinePage = profile => `<script>var TT_PROFILE_INFO = ${JSON.stringify(profile)};</script>
+<script>var hyPlayerConfig = { stream: ${JSON.stringify({ data: [], vMultiStreamInfo: [] })} };</script>`
+  const offline = offlinePage({ nick: '离线主播', avatar: 'http://img.example/a.jpg', profileRoom: 520520 })
+  const missing = offlinePage({ nick: '', avatar: '', profileRoom: 0 })
+  assert.throws(() => parseHuyaRoomPage(offline, 'saonan'), error => error.name === 'HuyaOfflineError'
+    && error.room.roomId === '520520' && error.room.nick === '离线主播' && error.room.logo === 'https://img.example/a.jpg')
+  assert.throws(() => parseHuyaRoomPage(missing, '17091'), error => error.name === 'HuyaRoomMissingError' && /17091 不存在/.test(error.message))
+
+  const pages = { '/saonan': offline, '/17091': missing, '/660101': huyaPlayerHtml }
+  const fetchImpl = async raw => {
+    const url = new URL(String(raw))
+    const html = pages[url.pathname]
+    return { ok: !!html, status: html ? 200 : 503, url: url.href, text: async () => html || '' }
+  }
+  const fetched = await huya.fetch(resolveConfig(huya, { rooms: 'saonan\n17091\n660101', topPerArea: 0 }), { fetchImpl })
+  assert.deepEqual(fetched.groups[0].dataList.map(c => [c.deferredRef, c.name, c.logo]), [
+    ['huya-520520', '离线主播 · 未开播', 'https://img.example/a.jpg'],
+    ['huya-660101', '虎牙测试直播', 'https://img.example/room.jpg'],
+  ])
+  assert.deepEqual(fetched.meta.warnings, ['虎牙房间 17091 不存在或已注销'])
+  // 填错一个、其余都没开播：照样列出「未开播」，不判整轮失败
+  const typoOnly = await huya.fetch(resolveConfig(huya, { rooms: 'saonan\n17091', topPerArea: 0 }), { fetchImpl })
+  assert.deepEqual(typoOnly.groups[0].dataList.map(c => c.name), ['离线主播 · 未开播'])
+  assert.deepEqual(typoOnly.meta.warnings, ['虎牙房间 17091 不存在或已注销'])
+  await assert.rejects(huya.fetch(resolveConfig(huya, { rooms: 'saonan', topAreas: '赛事', topPerArea: 8 }), { fetchImpl }),
+    /虎牙分类「赛事」抓取失败/, '分类抓失败时不能拿「未开播」占位冲掉上一轮缓存')
+})
+
+await checkAsync('虎牙：首选线路清单被拒即换下一条线路，分片被拒的线路同样跳过，被拒线路 5 分钟内不再碰', async () => {
+  clearHuyaResolveCache()
+  const config = resolveConfig(huya, {})
+  const upstream = huyaUpstream(huyaTwoLineHtml, { AL: { manifest: 403 }, TX: { segment: 403 } })
+  const first = await resolveHuyaRoom('huya-660101', { now: 1700000000000, config, fetchImpl: upstream.fetchImpl })
+  assert.match(first.url, /^https:\/\/hs\.hls\.huya\.com\/src\/abc\.m3u8\?/, 'AL 清单 403、TX 分片 403，落到 HS')
+  assert.match(first.desc, /HS 线路/)
+  assert.deepEqual(upstream.hits.manifest, { AL: 1, TX: 1, HS: 1 })
+  assert.deepEqual(upstream.hits.segment, { TX: 1, HS: 1 })
+
+  const second = await resolveHuyaRoom('huya-660101', { now: 1700000004000, config, fetchImpl: upstream.fetchImpl })
+  assert.equal(second.url, first.url)
+  assert.deepEqual(upstream.hits.manifest, { AL: 1, TX: 1, HS: 2 }, '冷却中的线路不再重试，直接用上次能播的')
+
+  const later = await resolveHuyaRoom('huya-660101', { now: 1700000000000 + 6 * 60 * 1000, config, fetchImpl: upstream.fetchImpl })
+  assert.match(later.url, /hs\.hls\.huya\.com/, '冷却过后仍优先上次能播的线路')
+  assert.equal(upstream.hits.manifest.AL, 1)
+})
+
+await checkAsync('虎牙：全部线路被拒时回失败，10 秒内不再替播放器重试上游，连败后间隔翻倍', async () => {
+  clearHuyaResolveCache()
+  const config = resolveConfig(huya, {})
+  const upstream = huyaUpstream(huyaTwoLineHtml, { AL: { manifest: 403 }, TX: { manifest: 403 }, HS: { manifest: 403 } })
+  const failed = await resolveHuyaRoom('huya-660101', { now: 1700000000000, config, fetchImpl: upstream.fetchImpl })
+  assert.equal(failed.url, '')
+  assert.match(failed.desc, /所有线路都不可用.*AL 线路清单 HTTP 403/)
+  const retry = await resolveHuyaRoom('huya-660101', { now: 1700000003000, config, fetchImpl: upstream.fetchImpl })
+  assert.equal(retry.url, '')
+  assert.deepEqual(upstream.hits.manifest, { AL: 1, TX: 1, HS: 1 }, '10 秒内连环重试不打上游')
+  const after = await resolveHuyaRoom('huya-660101', { now: 1700000012000, config, fetchImpl: upstream.fetchImpl })
+  assert.equal(after.url, '')
+  assert.deepEqual(upstream.hits.manifest, { AL: 2, TX: 2, HS: 2 }, '10 秒后全部线路再试一轮')
+  await resolveHuyaRoom('huya-660101', { now: 1700000012000 + 15 * 1000, config, fetchImpl: upstream.fetchImpl })
+  assert.deepEqual(upstream.hits.manifest, { AL: 2, TX: 2, HS: 2 }, '连续第二次全线失败后间隔翻倍到 20 秒')
+  await resolveHuyaRoom('huya-660101', { now: 1700000012000 + 21 * 1000, config, fetchImpl: upstream.fetchImpl })
+  assert.deepEqual(upstream.hits.manifest, { AL: 3, TX: 3, HS: 3 })
+})
+
+await checkAsync('虎牙：签名地址跨房间页刷新一直复用，到期的签名被拒先重签一次，没到期的签名被拒直接换线，主播重开才签新的', async () => {
+  clearHuyaResolveCache()
+  const config = resolveConfig(huya, {})
+  // 测试房间页的 wsTime 是 0x6553f100 = t0：签名在 t0 到期
+  const withWsTime = hex => huyaTwoLineHtml.replaceAll('6553f100', hex)
+  const t0 = 1700000000000 - 10 * 60 * 1000
+  const upstream = huyaUpstream(withWsTime('6553f100'))
+  const seqidOf = url => new URL(url).searchParams.get('seqid')
+  const first = await resolveHuyaRoom('huya-660101', { now: t0, config, fetchImpl: upstream.fetchImpl })
+  assert.match(first.url, /^https:\/\/al\.hls\.huya\.com\//)
+  for (const minute of [1, 2, 3, 4]) {
+    const again = await resolveHuyaRoom('huya-660101', { now: t0 + minute * 61 * 1000, config, fetchImpl: upstream.fetchImpl })
+    assert.equal(again.url, first.url, `第 ${minute} 次刷新房间页后签名地址不变（每分钟重签会触发 CDN 整条线路 403）`)
+  }
+  assert.equal(upstream.hits.page, 5, '房间页每 60 秒刷新一次')
+  assert.deepEqual(upstream.hits.segment, { AL: 1 }, '复用的签名不再探分片')
+
+  // 签名过了 wsTime 被拒一次：用最新房间页（wsTime 已往后推）重签后放行，留在同一线路
+  upstream.html = withWsTime((0x6553f100 + 600).toString(16))
+  upstream.rules.AL = { manifest: [403, 200] }
+  const resigned = await resolveHuyaRoom('huya-660101', { now: t0 + 10 * 60 * 1000 + 5000, config, fetchImpl: upstream.fetchImpl })
+  assert.match(resigned.url, /^https:\/\/al\.hls\.huya\.com\//, '重签后仍是 AL 线路')
+  assert.notEqual(seqidOf(resigned.url), seqidOf(first.url), '重签换了 seqid')
+  assert.equal(new URL(resigned.url).searchParams.get('wsTime'), (0x6553f100 + 600).toString(16), '重签用的是最新房间页的 wsTime')
+  assert.deepEqual(upstream.hits.segment, { AL: 2 }, '刚签出来的地址先探一片分片')
+  assert.equal(upstream.hits.manifest.TX, undefined, '没有去碰别的线路')
+  const held = await resolveHuyaRoom('huya-660101', { now: t0 + 10 * 60 * 1000 + 8000, config, fetchImpl: upstream.fetchImpl })
+  assert.equal(held.url, resigned.url, '重签后的地址继续复用')
+
+  // 离到期还早的签名又被拒：是线路在拒这个出口，不再重签（AL 有过「首取放行、再取就拒」，重签只会抖），直接换线
+  upstream.rules.AL = { manifest: 403 }
+  const switched = await resolveHuyaRoom('huya-660101', { now: t0 + 12 * 60 * 1000, config, fetchImpl: upstream.fetchImpl })
+  assert.match(switched.url, /^https:\/\/tx\.hls\.huya\.com\//, 'AL 没到期的签名被拒，换到 TX')
+  assert.equal(upstream.hits.manifest.AL, 9, '没到期的签名被拒不重签，只多打一次就放弃 AL')
+
+  // 主播重开（流名变了）：旧签名作废，签新的
+  upstream.html = upstream.html.replaceAll('"sStreamName":"abc"', '"sStreamName":"abd"')
+  const restarted = await resolveHuyaRoom('huya-660101', { now: t0 + 13 * 60 * 1000, config, fetchImpl: upstream.fetchImpl })
+  assert.match(restarted.url, /^https:\/\/tx\.hls\.huya\.com\/src\/abd\.m3u8\?/, '新流名签新地址')
+  assert.notEqual(seqidOf(restarted.url), seqidOf(switched.url))
+})
+
+check('虎牙：线路排序与分片地址解析', () => {
+  const lines = [{ cdn: 'AL' }, { cdn: 'TX' }, { cdn: 'HS' }]
+  assert.deepEqual(orderHuyaLines(lines, 'HS', new Map(), 0).map(line => line.cdn), ['HS', 'AL', 'TX'])
+  assert.deepEqual(orderHuyaLines(lines, '', new Map([['AL', 10]]), 5).map(line => line.cdn), ['TX', 'HS'])
+  assert.deepEqual(orderHuyaLines(lines, '', new Map([['AL', 10], ['TX', 10], ['HS', 10]]), 5).map(line => line.cdn), ['AL', 'TX', 'HS'], '全在冷却时退回全部')
+  assert.equal(huyaLastSegmentUrl(huyaManifest, 'https://al.hls.huya.com/src/abc.m3u8?a=1'), 'https://al.hls.huya.com/src/abc_2000-2.ts?x=1')
+  assert.equal(huyaLastSegmentUrl('#EXTM3U\n', 'https://al.hls.huya.com/src/abc.m3u8'), '')
+})
+
+// ---- 斗鱼直播 ----
+
+const douyuSignerCode = `
+var signerPadding = '${'x'.repeat(120)}';
+function ub98484234(rid, did, tt) {
+  return 'v=250120260830&did=' + did + '&tt=' + tt
+    + '&sign=' + CryptoJS.MD5(String(rid) + did + String(tt)).toString();
+}`
+
+const douyuMobileHtml = `<html><body>
+<script id="vike_pageContext" type="application/json">${JSON.stringify({
+  pageProps: { room: { roomInfo: { roomInfo: {
+    rid: 9999,
+    roomName: '陪伴每一天',
+    nickname: '测试主播',
+    avatar: 'https://img.example/avatar.jpg',
+    roomSrcSixteen: 'https://img.example/cover.jpg',
+    hn: '123.4万',
+    isLive: 1,
+  } } } },
+  crptext: douyuSignerCode,
+})}</script></body></html>`
+
+const douyuCategoryPayload = {
+  code: 0,
+  msg: 'success',
+  data: { rl: [
+    { rid: 9999, rn: '第一名', nn: '主播甲', ol: 2300000, rs16: '//img.example/1.jpg', c2name: 'DOTA2' },
+    { rid: 1234, rn: '第二名', nn: '主播乙', ol: 90000, rs16: 'https://img.example/2.jpg', c2name: '英雄联盟' },
+    { rid: 0, rn: '无效推荐位', ol: 9999999 },
+  ] },
+}
+
+check('斗鱼：房间号、PC/手机/分享地址归一并去重，拒绝外站地址', () => {
+  assert.equal(normalizeDouyuRoom('９９９９'), '9999')
+  assert.equal(normalizeDouyuRoom('https://www.douyu.com/9999?dyshid=1'), '9999')
+  assert.equal(normalizeDouyuRoom('https://m.douyu.com/9999'), '9999')
+  assert.equal(normalizeDouyuRoom('https://www.douyu.com/room/share/171717'), '171717')
+  assert.deepEqual(parseDouyuRoomList('9999\nhttps://www.douyu.com/9999\n# 注释\n1234'), ['9999', '1234'])
+  assert.throws(() => normalizeDouyuRoom('https://example.com/9999'), /不是斗鱼/)
+})
+
+check('斗鱼：官方分类接口字段归一，跳过占位卡片并保留官网人气', () => {
+  const rows = normalizeDouyuCategoryPayload(douyuCategoryPayload)
+  assert.equal(rows.length, 2)
+  assert.deepEqual(rows[0], {
+    roomId: '9999',
+    name: '第一名',
+    nick: '主播甲',
+    logo: 'https://img.example/1.jpg',
+    heat: 2300000,
+    category: 'DOTA2',
+  })
+})
+
+check('斗鱼：移动官网房间数据和动态匿名签名可在受限上下文解析', () => {
+  const room = parseDouyuMobileRoomPage(douyuMobileHtml, '9999')
+  assert.equal(room.roomId, '9999')
+  assert.equal(room.name, '陪伴每一天')
+  assert.equal(room.heat, 1234000)
+  const signed = createDouyuMobileSign(douyuSignerCode, room.roomId, ANONYMOUS_DID, 1700000000)
+  assert.equal(signed.get('v'), '250120260830')
+  assert.equal(signed.get('did'), ANONYMOUS_DID)
+  assert.equal(signed.get('tt'), '1700000000')
+  assert.equal(signed.get('sign'), createHash('md5').update(`9999${ANONYMOUS_DID}1700000000`).digest('hex'))
+  assert.throws(() => createDouyuMobileSign('function ub98484234(){}', '9999'), /不完整/)
+})
+
+check('斗鱼：只接受官方 CDN 的 HLS 地址', () => {
+  assert.equal(isOfficialDouyuStreamUrl('http://openhls-hw.douyucdn2.cn/live/a.m3u8?token=x'), true)
+  assert.equal(isOfficialDouyuStreamUrl('https://stream.example.com/live/a.m3u8'), false)
+  assert.equal(isOfficialDouyuStreamUrl('https://openhls-hw.douyucdn2.cn/live/a.flv'), false)
+})
+
+check('斗鱼：默认配置控制分类、数量、人气与画质，所有频道固定放入斗鱼组', () => {
+  const areas = douyu.configSchema.find(field => field.key === 'topAreas')
+  assert.equal(areas.type, 'multiselect')
+  assert.deepEqual(areas.options.map(option => option.value), ['全部', '网游竞技', '单机热游', '手游休闲', '娱乐', '一起看'])
+  assert.deepEqual(parseDouyuAreaNames(areas.default), ['一起看'], '默认只收核验过的影视正片房间，其他分类由用户自选')
+  assert.equal(douyu.configSchema.find(field => field.key === 'topPerArea').default, 8)
+  assert.equal(douyu.configSchema.find(field => field.key === 'minHeat').default, DEFAULT_DOUYU_MIN_HEAT)
+  assert.equal(douyu.configSchema.find(field => field.key === 'quality').default, 3)
+  assert.deepEqual(mergeDouyuRooms(
+    [{ roomId: '1', name: '手填' }],
+    [{ roomId: '1', name: '重复' }, { roomId: '2', name: '自动' }],
+  ).map(room => room.name), ['手填', '自动'])
+  assert.equal(DOUYU_GROUP, '斗鱼')
+})
+
+await checkAsync('斗鱼：手填房间没开播也列出「主播 · 未开播」；只剩占位又有真出错时整轮判失败', async () => {
+  const offlineHtml = `<html><body><script id="vike_pageContext" type="application/json">${JSON.stringify({
+    pageProps: { room: { roomInfo: { roomInfo: {
+      rid: 606118, roomName: '今天休息不播', nickname: '离线主播', avatar: '//img.example/avatar.jpg', isLive: 0,
+    } } } },
+  })}</script></body></html>`
+  assert.throws(() => parseDouyuMobileRoomPage(offlineHtml, '606118'), error => error.name === 'DouyuOfflineError'
+    && error.room.roomId === '606118' && error.room.nick === '离线主播' && error.room.logo === 'https://img.example/avatar.jpg')
+  const pages = { '/606118': offlineHtml, '/9999': douyuMobileHtml }
+  const fetchImpl = async raw => {
+    const url = new URL(String(raw))
+    const html = pages[url.pathname]
+    return { ok: !!html, status: html ? 200 : 503, text: async () => html || '' }
+  }
+  const fetched = await douyu.fetch(resolveConfig(douyu, { rooms: '606118\n9999', topPerArea: 0 }), { fetchImpl })
+  assert.deepEqual(fetched.groups[0].dataList.map(c => [c.deferredRef, c.name, c.logo]), [
+    ['douyu-606118', '离线主播 · 未开播', 'https://img.example/avatar.jpg'],
+    ['douyu-9999', '陪伴每一天', 'https://img.example/cover.jpg'],
+  ])
+  assert.deepEqual(fetched.meta.warnings, [])
+  await assert.rejects(douyu.fetch(resolveConfig(douyu, { rooms: '606118', topAreas: '网游竞技', topPerArea: 8 }), { fetchImpl }),
+    /斗鱼分类「网游竞技」抓取失败/, '分类抓失败时不能拿「未开播」占位冲掉上一轮缓存')
+})
+
+await checkAsync('虎牙一起看：先核对房号、分区和当前节目，再取人气前几名', async () => {
+  const rows = [
+    { lProfileRoom: 11342412, sIntroduction: '周星驰电影解说', sGameFullName: '一起看', lTotalCount: 9000 },
+    { lProfileRoom: 23740156, sIntroduction: '庆余年2', sGameFullName: '原创', lTotalCount: 8000 },
+    { lProfileRoom: 11342384, sIntroduction: '今晚闲聊', sGameFullName: '一起看', lTotalCount: 7000 },
+    { lProfileRoom: 999, sIntroduction: '纪晓岚', sGameFullName: '一起看', lTotalCount: 6000 },
+    { lProfileRoom: 11342396, sIntroduction: '铁齿铜ya纪晓岚 经典铁三角组合', sGameFullName: '一起看', lTotalCount: 5000 },
+  ]
+  const config = resolveConfig(huya, { topAreas: '一起看', topPerArea: 1 })
+  const result = await huya.fetch(config, { fetchImpl: async url => {
+    assert.equal(String(url), 'https://www.huya.com/g/2135')
+    return new Response('var ALL_LIST_DATA = ' + JSON.stringify(rows) + ';')
+  } })
+  assert.deepEqual(result.groups[0].dataList.map(room => room.deferredRef), ['huya-11342396'])
+})
+
+await checkAsync('斗鱼一起看：去掉跨区推荐、改播和低人气房，全部不符时返回空组', async () => {
+  const rows = [
+    { rid: 4549169, rn: '橙記 港剧间', c2name: '原创IP', ol: 90000 },
+    { rid: 431460, rn: '【贝贝】亮剑花絮', c2name: '一起看', ol: 80000 },
+    { rid: 501, rn: '亮剑', c2name: '一起看', ol: 70000 },
+    { rid: 12655359, rn: '神探狄仁杰', c2name: '一起看', ol: 60000 },
+  ]
+  const ctx = { fetchImpl: async url => {
+    assert.equal(String(url), 'https://www.douyu.com/gapi/rknc/directory/mixListV1/2_208/1')
+    return Response.json({ code: 0, data: { rl: rows } })
+  } }
+  const config = resolveConfig(douyu, { topAreas: '一起看', minHeat: 55000 })
+  const result = await douyu.fetch(config, ctx)
+  assert.deepEqual(result.groups[0].dataList.map(room => room.deferredRef), ['douyu-12655359'])
+  assert.deepEqual((await douyu.fetch({ ...config, minHeat: 65000 }, ctx)).groups, [])
+})
+
+await checkAsync('斗鱼：模块抓取分类热门房间，播放时匿名刷新短效 HLS 并要求清单中继', async () => {
+  clearDouyuResolveCache()
+  const config = resolveConfig(douyu, { topAreas: '网游竞技' })
+  const fetched = await douyu.fetch(config, { fetchImpl: async url => {
+    assert.equal(String(url), 'https://www.douyu.com/gapi/rkc/directory/mixListV1/1_1/1')
+    return { ok: true, status: 200, json: async () => douyuCategoryPayload }
+  } })
+  assert.equal(fetched.groups[0].name, '斗鱼')
+  assert.equal(fetched.groups[0].dataList.length, 1, '默认 10 万人气应过滤第二条')
+  assert.equal(fetched.groups[0].dataList[0].deferredRef, 'douyu-9999')
+  assert.equal(fetched.groups[0].dataList[0].relayHls, true)
+  assert.equal(fetched.groups[0].dataList[0].opts, undefined, 'LunaTV 导入时 EXTINF 后必须紧跟地址')
+
+  let calls = 0
+  const resolved = await resolveDouyuRoom('douyu-9999', {
+    now: 1700000000000,
+    config,
+    fetchImpl: async (url, options = {}) => {
+      calls++
+      if (calls === 1) {
+        assert.equal(String(url), 'https://m.douyu.com/9999')
+        return { ok: true, status: 200, text: async () => douyuMobileHtml }
+      }
+      assert.equal(String(url), 'https://m.douyu.com/hgapi/livenc/room/getStreamUrl')
+      assert.equal(options.method, 'POST')
+      const body = new URLSearchParams(String(options.body))
+      assert.equal(body.get('rid'), '9999')
+      assert.equal(body.get('rate'), '3')
+      assert.equal(body.get('did'), ANONYMOUS_DID)
+      return { ok: true, status: 200, json: async () => ({
+        error: 0,
+        data: {
+          settings: [{ name: '超清', rate: 3 }],
+          rate: 3,
+          pass: 0,
+          url: 'http://openhls-hw.douyucdn2.cn/live/test_2000.m3u8?txSecret=abc',
+        },
+      }) }
+    },
+  })
+  assert.equal(resolved.url, 'https://openhls-hw.douyucdn2.cn/live/test_2000.m3u8?txSecret=abc')
+  assert.match(resolved.desc, /超清地址获取成功/)
+  assert.equal(resolved.relayHls, true)
+  assert.equal(resolved.upstreamHeaders.Referer, 'https://m.douyu.com/')
+})
+
+// ---- 按频道覆盖画质（issue #185）与 B 站 4K / 杜比（issue #186）----
+
+check('画质覆盖：?quality= 只认下拉框里的档，认不出回落到后台配置', () => {
+  const options = [{ value: 0 }, { value: 2000 }]
+  assert.equal(qualityFrom({ config: { quality: 2000 }, query: { quality: '0' } }, options, 2000), 0)
+  assert.equal(qualityFrom({ config: { quality: 0 }, query: { quality: '2000' } }, options, 2000), 2000)
+  assert.equal(qualityFrom({ config: { quality: 0 }, query: { quality: '1234' } }, options, 2000), 0, '不在档位表里')
+  assert.equal(qualityFrom({ config: { quality: 0 }, query: { quality: 'abc' } }, options, 2000), 0)
+  assert.equal(qualityFrom({ config: { quality: 2000 }, query: { quality: '' } }, options, 2000), 2000, '空值不当 0')
+  assert.equal(qualityFrom({ config: {} }, options, 2000), 2000, '后台没存过用默认')
+})
+
+check('画质覆盖：三个直播模块都声明纯直播，查询参数不会被当回看参数拼进签名地址', () => {
+  for (const mod of [huya, douyu, bili]) {
+    assert.equal(mod.capabilities.catchup, false, mod.id)
+    assert.ok(mod.configSchema.some(field => field.key === 'quality'), `${mod.id} 有画质选项`)
+  }
+  assert.equal(bili.configSchema.find(field => field.key === 'quality').default, 0, 'B 站默认最高画质')
+})
+
+await checkAsync('画质覆盖：播放地址的查询参数交给模块，签名地址原样下发', async () => {
+  const original = huya.resolve
+  let seen = null
+  huya.resolve = async (ref, ctx) => {
+    seen = { ref, query: ctx.query }
+    return { url: 'https://al.hls.huya.com/src/abc.m3u8?wsSecret=x' }
+  }
+  try {
+    const result = await playbackChannel('/huya-660101?quality=0', '', '')
+    assert.equal(seen.ref, 'huya-660101')
+    assert.deepEqual(seen.query, { quality: '0' })
+    assert.equal(result.playURL, 'https://al.hls.huya.com/src/abc.m3u8?wsSecret=x', '不能拼出 &quality=0')
+    await playbackChannel('/huya-660101', '', '')
+    assert.deepEqual(seen.query, {}, '没有参数时是空对象')
+  } finally {
+    huya.resolve = original
+  }
+})
+
+await checkAsync('回看声明：纯直播模块收到 playbackbegin / playbackend 不往上游地址上拼，咪咕照旧透传', async () => {
+  const query = '?playbackbegin=20261119100000&playbackend=20261119110000'
+  const resolveWith = async (id, ref, url) => {
+    const module = getModule(id)
+    const original = module.resolve
+    module.resolve = async () => ({ url })
+    try {
+      return await playbackChannel(`/${ref}${query}`, '', '')
+    } finally {
+      module.resolve = original
+    }
+  }
+  for (const [id, ref, url] of [
+    // 带签名查询串的：以前拼成 …&playbackbegin=…，上游不认、照回直播
+    ['gztv', 'gztv-3001', 'https://tencentplaywebsite.gztv.com/live/zonghes.m3u8?txSecret=abc&txTime=1a1f28cc2b1'],
+    // 不带查询串的：以前拼成 …/x.m3u8&playbackbegin=…，路径坏了，上游 403/404
+    ['gxtv', 'gxtv-gxws', 'https://hlscdn.liangtv.cn/live/abc/def.m3u8'],
+  ]) {
+    const result = await resolveWith(id, ref, url)
+    assert.equal(result.code, 302, id)
+    assert.equal(result.playURL, url, `${id} 的上游地址要原样下发`)
+  }
+  const migu = await resolveWith('migu', '608807420', 'https://hlszymgsplive.miguvideo.com/x/index.m3u8?msisdn=1&puData=abc')
+  assert.equal(migu.playURL,
+    'https://hlszymgsplive.miguvideo.com/x/index.m3u8?msisdn=1&puData=abc&playbackbegin=20261119100000&playbackend=20261119110000')
+})
+
+await checkAsync('虎牙：?quality=0 覆盖后台 2M，去掉 ratio 取原画，并与 2M 分开缓存', async () => {
+  clearHuyaResolveCache()
+  const config = resolveConfig(huya, {})
+  assert.equal(config.quality, 2000)
+  const upstream = huyaUpstream(huyaPlayerHtml)
+  const normal = await resolveHuyaRoom('huya-660101', { now: 1700000000000, config, fetchImpl: upstream.fetchImpl })
+  assert.equal(new URL(normal.url).searchParams.get('ratio'), '2000')
+  const best = await resolveHuyaRoom('huya-660101', { now: 1700000001000, config, query: { quality: '0' }, fetchImpl: upstream.fetchImpl })
+  assert.equal(new URL(best.url).searchParams.has('ratio'), false, '原画不带 ratio')
+  assert.match(best.desc, /原画/)
+  assert.equal(upstream.hits.page, 2, '不同画质各取一次房间页')
+  clearHuyaResolveCache()
+})
+
+await checkAsync('斗鱼：?quality=0 覆盖后台超清，按原画取流', async () => {
+  clearDouyuResolveCache()
+  const config = resolveConfig(douyu, {})
+  const rates = []
+  const fetchImpl = async (url, options = {}) => {
+    if (String(url) === 'https://m.douyu.com/9999') return { ok: true, status: 200, text: async () => douyuMobileHtml }
+    const rate = new URLSearchParams(String(options.body)).get('rate')
+    rates.push(rate)
+    return { ok: true, status: 200, json: async () => ({
+      error: 0,
+      data: { settings: [{ name: '原画', rate: 0 }, { name: '超清', rate: 3 }], rate: Number(rate), pass: 0, url: `https://openhls-hw.douyucdn2.cn/live/test_${rate}.m3u8` },
+    }) }
+  }
+  const best = await resolveDouyuRoom('douyu-9999', { now: 1700000000000, config, query: { quality: '0' }, fetchImpl })
+  assert.match(best.desc, /原画地址获取成功/)
+  await resolveDouyuRoom('douyu-9999', { now: 1700000000000, config, fetchImpl })
+  await resolveDouyuRoom('douyu-9999', { now: 1700000000000, config, query: { quality: '9' }, fetchImpl })
+  assert.deepEqual(rates, ['0', '3'], '认不出的档回落到后台超清，且命中超清的缓存')
+  clearDouyuResolveCache()
+})
+
+await checkAsync('斗鱼：画质提示按地址流名后缀写实际档位，未登录要原画给了超清时注明', async () => {
+  clearDouyuResolveCache()
+  const config = resolveConfig(douyu, {})
+  // 10-19 实测：未登录 rate=0 时接口仍回 rate 0 / 原画1080P60，地址却是 _2000（720P）
+  const fetchImpl = async url => {
+    if (String(url) === 'https://m.douyu.com/9999') return { ok: true, status: 200, text: async () => douyuMobileHtml }
+    return { ok: true, status: 200, json: async () => ({
+      error: 0,
+      data: { settings: [{ name: '原画1080P60', rate: 0 }, { name: '超清', rate: 3 }], rate: 0, pass: 0, url: 'https://openhls-hw.douyucdn2.cn/live/9999rAbc_2000.m3u8?txSecret=x' },
+    }) }
+  }
+  const best = await resolveDouyuRoom('douyu-9999', { now: 1700000000000, config, query: { quality: '0' }, fetchImpl })
+  assert.match(best.desc, /超清地址获取成功（未登录官方最高只给到这一档）/)
+  assert.doesNotMatch(best.desc, /原画/)
+  clearDouyuResolveCache()
+})
+
+/** 按请求里的 qn 回包：qn 档有就给这一档，accept_qn 是房间全部档位，cap 模拟没登录被封顶。 */
+const biliQnFixture = ({ accept, cap = Infinity, codec = 'avc' }) => {
+  const qns = []
+  const fetchImpl = async raw => {
+    const url = new URL(String(raw))
+    const asked = Number(url.searchParams.get('qn'))
+    qns.push(asked)
+    const current = Math.min(cap, Math.max(...accept.filter(qn => qn <= asked), Math.min(...accept)))
+    const payload = { code: 0, data: playurl([
+      { protocol_name: 'http_hls', format: [{ codec: [{
+        ...codecOf(codec, `/live_${current}.m3u8`, 'https://cn-gotcha.bilivideo.com', '?sign=x'),
+        current_qn: current,
+        accept_qn: accept,
+      }] }] },
+    ]) }
+    return { ok: true, status: 200, json: async () => payload }
+  }
+  return { fetchImpl, qns }
+}
+
+await checkAsync('B 站：最高画质先按原画请求，房间有 4K / 杜比时再要一次', async () => {
+  clearBiliResolveCache()
+  const room = biliQnFixture({ accept: [30000, 20000, 10000, 400, 250] })
+  const best = await resolveBiliRoom('bili-21144080', { now: 1700000000000, config: { sessdata: 'abc' }, fetchImpl: room.fetchImpl })
+  assert.deepEqual(room.qns, [10000, 30000])
+  assert.match(best.url, /live_30000\.m3u8/)
+  assert.match(best.desc, /杜比/)
+  clearBiliResolveCache()
+})
+
+await checkAsync('B 站：房间最高就是原画、或已被降档（没登录）时，不多打一次接口', async () => {
+  clearBiliResolveCache()
+  const plain = biliQnFixture({ accept: [10000, 400, 250] })
+  const top = await resolveBiliRoom('bili-1', { now: 1700000000000, config: { sessdata: 'abc' }, fetchImpl: plain.fetchImpl })
+  assert.deepEqual(plain.qns, [10000])
+  assert.match(top.desc, /原画/)
+
+  const anon = biliQnFixture({ accept: [20000, 10000, 400, 250], cap: 250 })
+  const capped = await resolveBiliRoom('bili-2', { now: 1700000000000, config: {}, fetchImpl: anon.fetchImpl })
+  assert.deepEqual(anon.qns, [10000], '被封顶超清，再往上要也拿不到')
+  assert.match(capped.desc, /超清/)
+  clearBiliResolveCache()
+})
+
+await checkAsync('B 站：指定档位直接按 qn 请求；?quality= 覆盖后台并分开缓存', async () => {
+  clearBiliResolveCache()
+  const room = biliQnFixture({ accept: [20000, 10000, 400, 250] })
+  const config = { sessdata: 'abc', quality: 400 }
+  const blue = await resolveBiliRoom('bili-3', { now: 1700000000000, config, fetchImpl: room.fetchImpl })
+  assert.match(blue.desc, /蓝光/)
+  const best = await resolveBiliRoom('bili-3', { now: 1700000000000, config, query: { quality: '0' }, fetchImpl: room.fetchImpl })
+  assert.match(best.desc, /4K/)
+  assert.deepEqual(room.qns, [400, 10000, 20000])
+  await resolveBiliRoom('bili-3', { now: 1700000001000, config, fetchImpl: room.fetchImpl })
+  assert.equal(room.qns.length, 3, '后台档位的缓存不被覆盖档顶掉')
+  clearBiliResolveCache()
+})
+
+await checkAsync('B 站：抓取时按后台画质要流，频道名的档位与播放一致', async () => {
+  const room = biliQnFixture({ accept: [20000, 10000, 400, 250] })
+  const payloads = biliApiFixture()
+  const fetchImpl = async (raw, init) => new URL(String(raw)).pathname === '/xlive/web-room/v2/index/getRoomPlayInfo'
+    ? room.fetchImpl(raw, init)
+    : payloads.fetchImpl(raw, init)
+  const { channel } = await fetchBiliRoom('21144080', { cookie: 'SESSDATA=abc', quality: 0, fetchImpl })
+  assert.match(channel.name, /^\[4K\] /)
+  const fixed = await fetchBiliRoom('21144080', { cookie: 'SESSDATA=abc', quality: 400, fetchImpl })
+  assert.match(fixed.channel.name, /^\[蓝光\] /)
+})
+
+// ---- 广西网络台 / 浙江新蓝网 ----
+
+const fakeResponse = payload => ({
+  ok: true,
+  status: 200,
+  json: async () => payload,
+  text: async () => typeof payload === 'string' ? payload : JSON.stringify(payload),
+})
+
+check('广西：只取官网正式频道、规范命名并排除内部/专题流', () => {
+  const rows = [
+    { name: '新闻在线网络直播专用', state: 1, showChannel: 1, decodeM3u8: 'https://x/internal.m3u8' },
+    { name: '广西卫视', state: 1, showChannel: 1, encodeM3u8: 'https://x/gxws.m3u8', logo: 'https://x/gx.png' },
+    { name: '新闻频道', state: 1, showChannel: 1, encodeM3u8: 'https://x/news.m3u8' },
+    { name: '移动数字电视频道', state: 1, showChannel: 1, encodeM3u8: 'https://x/mobile.m3u8' },
+    { name: '乐思购频道', state: 1, showChannel: 1, encodeM3u8: 'https://x/shop.m3u8' },
+    { name: '中国教育电视台CETV-1频道', state: 1, showChannel: 1, encodeM3u8: 'https://x/cetv1.m3u8' },
+    { name: '《广西新闻》矩阵号', state: 1, showChannel: 1, encodeM3u8: 'https://x/matrix.m3u8' },
+  ]
+  const groups = buildGxtvGroups(rows, { includeSpecialty: true, includeCetv: true })
+  assert.deepEqual(groups.map(g => g.name), ['广西电视台'])
+  assert.deepEqual(groups[0].dataList.map(ch => ch.name), ['广西卫视', '广西新闻', '广西移动'])
+  assert.ok(groups[0].dataList.every(channel => channel.catchup === 'none'), '纯直播：逐条关掉订阅头的回看声明')
+})
+
+check('广西：HLS 字段按优先级回落，非 HLS/坏 URL 不进入播放列表', () => {
+  assert.equal(streamUrlOf({ encodeM3u8: '', decodeM3u8: 'https://x/live.m3u8' }), 'https://x/live.m3u8')
+  assert.equal(streamUrlOf({ encodeM3u8: 'https://x/live.flv' }), '')
+  assert.equal(streamUrlOf({ encodeM3u8: '[B@31aae2e6' }), '')
+})
+
+await checkAsync('广西：模块按官网 POST 形状取数并产出全代理引用', async () => {
+  const module = getModule('gxtv')
+  let request
+  const fetchImpl = async (url, options) => {
+    request = { url, options }
+    return fakeResponse({ code: 0, data: { rows: [
+      { name: '广西卫视', state: 1, showChannel: 1, encodeM3u8: 'https://x/gxws.m3u8' },
+    ] } })
+  }
+  const result = await module.fetch({ includeSpecialty: true, includeCetv: false }, { fetchImpl })
+  assert.equal(request.options.method, 'POST')
+  assert.match(request.options.body, /pageSize=1000/)
+  assert.equal(result.groups[0].dataList[0].deferredRef, 'gxtv-gxws')
+  assert.equal(result.groups[0].dataList[0].proxyHls, true)
+  assert.equal('url' in result.groups[0].dataList[0], false)
+})
+
+await checkAsync('广西：resolve 使用已抓到的正式 HLS，格式错误/断网均不抛', async () => {
+  clearGxtvStreamCache()
+  let calls = 0
+  const fetchImpl = async () => {
+    calls++
+    return fakeResponse({ code: 0, data: { rows: [
+      {
+        name: '广西卫视', state: 1, showChannel: 1,
+        encodeM3u8: 'https://x/gxws.m3u8', encodingId: 'id', encodingKey: 'key',
+      },
+    ] } })
+  }
+  const first = await resolveGxtvChannel('gxtv-gxws', { fetchImpl, now: 1720000000000 })
+  const second = await resolveGxtvChannel('gxtv-gxws', { fetchImpl, now: 1720000000001 })
+  assert.equal(first.url, 'https://x/gxws.m3u8')
+  assert.equal(typeof first.segmentTransform, 'function')
+  assert.equal(second.url, first.url)
+  assert.equal(calls, 1, '代理周期性拉清单时不能每次都重打频道 API')
+  assert.equal((await resolveGxtvChannel('gxtv-unknown')).url, '')
+
+  clearGxtvStreamCache()
+  const failed = await resolveGxtvChannel('gxtv-gxws', {
+    fetchImpl: async () => { throw new Error('断网') }, now: 1720000000002,
+  })
+  assert.equal(failed.url, '')
+  assert.match(failed.desc, /请求失败/)
+})
+
+await checkAsync('广西：30 分钟到期刷新失败沿用旧密钥，一分钟后再试并恢复新值', async () => {
+  clearGxtvStreamCache()
+  const startedAt = 1720000000000
+  const row = (url, key) => ({
+    name: '广西卫视', state: 1, showChannel: 1, encodeM3u8: url,
+    encodingId: 'customer', encodingKey: key,
+  })
+  let calls = 0
+  const first = await resolveGxtvChannel('gxtv-gxws', {
+    now: startedAt,
+    fetchImpl: async () => {
+      calls++
+      return fakeResponse({ code: 0, data: { rows: [row('https://x/old.m3u8', 'old-key')] } })
+    },
+  })
+  assert.equal(first.url, 'https://x/old.m3u8')
+
+  const stale = await resolveGxtvChannel('gxtv-gxws', {
+    now: startedAt + 30 * 60 * 1000 + 1,
+    fetchImpl: async () => { calls++; throw new Error('官网瞬时故障') },
+  })
+  assert.equal(stale.url, first.url)
+  assert.match(stale.desc, /沿用上一份/)
+
+  const retrySuppressed = await resolveGxtvChannel('gxtv-gxws', {
+    now: startedAt + 30 * 60 * 1000 + 30 * 1000,
+    fetchImpl: async () => { calls++; throw new Error('一分钟内不应重试') },
+  })
+  assert.equal(retrySuppressed.url, first.url)
+  assert.equal(calls, 2, '清单每几秒轮询时不能持续轰炸故障中的官网接口')
+
+  const recovered = await resolveGxtvChannel('gxtv-gxws', {
+    now: startedAt + 31 * 60 * 1000 + 2,
+    fetchImpl: async () => {
+      calls++
+      return fakeResponse({ code: 0, data: { rows: [row('https://x/new.m3u8', 'new-key')] } })
+    },
+  })
+  assert.equal(recovered.url, 'https://x/new.m3u8')
+  assert.equal(calls, 3)
+})
+
+check('浙江：频道名规范化、deferredRef 带平台前缀并固定排除购物频道', () => {
+  const rows = [
+    { name: '浙江卫视', station_code: '101', logo: 'http://oss/a.png' },
+    { name: '新闻', station_code: '107', logo: 'https://oss/n.png' },
+    { name: '好易购', station_code: '111', logo: 'https://oss/s.png' },
+    { name: '未知内部频道', station_code: '999' },
+  ]
+  const channels = buildCztvChannels(rows)
+  assert.deepEqual(channels.map(ch => [ch.name, ch.deferredRef]), [
+    ['浙江卫视', 'cztv-101'],
+    ['浙江新闻', 'cztv-107'],
+  ])
+  assert.equal(channels[0].logo, 'https://oss/a.png', '台标升级为 HTTPS')
+  assert.ok(channels.every(channel => channel.catchup === 'none'), '纯直播：逐条关掉订阅头的回看声明')
+  assert.equal(channels[0].relayHls, true, '浙江清单需经本机中继，播放中才能持续换签和切 CDN')
+})
+
+await checkAsync('浙江：播放缓冲固定 3000ms，旧配置不再影响输出', async () => {
+  const module = getModule('cztv')
+  const result = await module.fetch({ cachingMs: 0 }, {
+    fetchImpl: async () => fakeResponse({
+      state: 0,
+      content: { list: [{ name: '浙江卫视', station_code: '101' }] },
+    }),
+  })
+  assert.deepEqual(result.groups[0].dataList[0].opts, ['network-caching=3000'])
+})
+
+check('浙江：优先目标画质、缺档自动回落，绝不误选 AUDIO', () => {
+  const playInfo = { multiBitrateStreamList: [
+    { bitrateCode: 'AUDIO', urlList: ['https://x/audio.m3u8'] },
+    { bitrateCode: '720P', urlList: ['https://x/720.m3u8'] },
+    { bitrateCode: '1080P', urlList: ['https://x/1080.m3u8'] },
+  ] }
+  assert.equal(selectCztvStream(playInfo, '1080P').url, 'https://x/1080.m3u8')
+  assert.equal(selectCztvStream(playInfo, '720P').url, 'https://x/720.m3u8')
+  assert.equal(selectCztvStream({ multiBitrateStreamList: [playInfo.multiBitrateStreamList[0]] }, '1080P'), null)
+})
+
+check('浙江：auth_key 与官网当前毫秒签名算法逐字节一致', () => {
+  const signed = new URL(signCztvStreamUrl('https://zwebl04.cztv.com/live/channel011080Pnew.m3u8', 1720000000000))
+  assert.equal(
+    signed.searchParams.get('auth_key'),
+    '1720000000000-0-0-0c9ec6316a9ac89cc6f1c05c406d0833',
+  )
+})
+
+await checkAsync('浙江：resolve 获取播放信息、选码率、现签地址，失败不抛异常', async () => {
+  clearCztvPlayInfoCache()
+  let calls = 0
+  const fetchImpl = async () => {
+    calls++
+    return fakeResponse({ success: true, code: 200, data: { multiBitrateStreamList: [
+      { bitrateCode: '720P', urlList: ['https://zwebl04.cztv.com/live/channel08720Pnew.m3u8'] },
+      { bitrateCode: '1080P', urlList: ['https://zwebl04.cztv.com/live/channel081080Pnew.m3u8'] },
+    ] } })
+  }
+  const result = await resolveCztvChannel('cztv-108', {
+    config: { quality: '720P' }, fetchImpl, now: 1720000000000,
+  })
+  assert.equal(calls, 1)
+  assert.match(result.url, /channel081080Pnew\.m3u8\?auth_key=1720000000000-0-0-/,
+    '旧配置即使残留 quality=720P 也必须固定选择最高档')
+  assert.equal(result.relayHls, true, '旧的无后缀入口也必须持续直出清单，不能一次 302 后锁死 CDN')
+
+  const bad = await resolveCztvChannel('cztv-999', {
+    fetchImpl: async () => { throw new Error('断网') }, now: 1720000000001,
+  })
+  assert.equal(bad.url, '')
+  assert.match(bad.desc, /请求失败/)
+})
+
+await checkAsync('浙江：首个 CDN 节点故障时自动选择后续可用节点，并短期复用健康结果', async () => {
+  clearCztvPlayInfoCache()
+  let apiCalls = 0
+  let probeCalls = 0
+  const fetchImpl = async () => {
+    apiCalls++
+    return fakeResponse({ success: true, code: 200, data: { multiBitrateStreamList: [
+      { bitrateCode: '1080P', urlList: [
+        'https://zwebl03.cztv.com/live/channel011080Pnew.m3u8',
+        'https://zwebl06.cztv.com/live/channel011080Pnew.m3u8',
+      ] },
+    ] } })
+  }
+  const probeFetchImpl = async url => {
+    probeCalls++
+    const ok = url.includes('zwebl06.cztv.com')
+    return { ok, status: ok ? 200 : 403, text: async () => ok ? '#EXTM3U\n' : '' }
+  }
+
+  const first = await resolveCztvChannel('cztv-101', {
+    now: 1720000000000, fetchImpl, probeFetchImpl, config: { quality: '1080P' },
+  })
+  assert.match(first.url, /zwebl06\.cztv\.com/)
+  assert.equal(apiCalls, 1)
+  assert.equal(probeCalls, 2)
+
+  const cached = await resolveCztvChannel('cztv-101', {
+    now: 1720000001000, fetchImpl, probeFetchImpl, config: { quality: '1080P' },
+  })
+  assert.match(cached.url, /zwebl06\.cztv\.com/)
+  assert.equal(apiCalls, 1, '播放信息五分钟内复用')
+  assert.equal(probeCalls, 2, '健康节点十五秒内复用，避免每次清单轮询都重复探测')
+})
+
+await checkAsync('浙江：5 分钟到期刷新失败沿用旧播放信息，一分钟后自动恢复', async () => {
+  clearCztvPlayInfoCache()
+  const startedAt = 1720000000000
+  const payload = path => fakeResponse({ success: true, code: 200, data: { multiBitrateStreamList: [
+    { bitrateCode: '1080P', urlList: [`https://zwebl04.cztv.com/live/${path}.m3u8`] },
+  ] } })
+  let calls = 0
+  const first = await resolveCztvChannel('cztv-101', {
+    now: startedAt,
+    fetchImpl: async () => { calls++; return payload('old') },
+  })
+  assert.match(first.url, /\/old\.m3u8/)
+
+  const stale = await resolveCztvChannel('cztv-101', {
+    now: startedAt + 5 * 60 * 1000 + 1,
+    fetchImpl: async () => { calls++; throw new Error('官网瞬时故障') },
+  })
+  assert.match(stale.url, /\/old\.m3u8/)
+
+  const retrySuppressed = await resolveCztvChannel('cztv-101', {
+    now: startedAt + 5 * 60 * 1000 + 30 * 1000,
+    fetchImpl: async () => { calls++; throw new Error('一分钟内不应重试') },
+  })
+  assert.match(retrySuppressed.url, /\/old\.m3u8/)
+  assert.equal(calls, 2)
+
+  const recovered = await resolveCztvChannel('cztv-101', {
+    now: startedAt + 6 * 60 * 1000 + 2,
+    fetchImpl: async () => { calls++; return payload('new') },
+  })
+  assert.match(recovered.url, /\/new\.m3u8/)
+  assert.equal(calls, 3)
+})
+
+// ---- 看看新闻（上海电视台） ----
+
+check('看看新闻：可播放的 v1 请求验签与官网双 MD5 算法固定样本一致', () => {
+  const headers = buildKankanewsSignedHeaders({ channel_id: '2' }, {
+    now: 1720000000000,
+    nonce: 'abcd1234',
+    uuid: '0123456789ABCDEFGHIJK',
+  })
+  assert.equal(headers.timestamp, 1720000000)
+  assert.equal(headers['Api-Version'], 'v1')
+  assert.equal(headers.version, '2.45.2')
+  assert.equal(headers['m-uuid'], '0123456789ABCDEFGHIJK')
+  assert.equal(headers.sign, '3128fcbe0a188dbe4da6d255bd80628a')
+})
+
+check('看看新闻：只收录官网 8 个正式上海频道，规范命名并固定全代理', () => {
+  const rows = [
+    { id: 2, name: '新闻综合', cover: 'http://p.statickksmg.com/news.png' },
+    { id: 1, name: '东方卫视', cover: 'https://p.statickksmg.com/dfws.png' },
+    { id: 11, name: '魔都眼' },
+    { id: 5, name: '第一财经' },
+    { id: 12, name: '新纪实' },
+    { id: 10, name: '五星体育' },
+    { id: 4, name: '都市频道' },
+    { id: 9, name: '哈哈炫动' },
+    { id: 99, name: '临时测试频道' },
+  ]
+  const channels = buildKankanewsChannels(rows)
+  assert.deepEqual(channels.map(channel => channel.name), [
+    '东方卫视', '上海新闻综合', '魔都眼', '第一财经',
+    '新纪实', '五星体育', '上海都市', '哈哈炫动',
+  ])
+  assert.equal(channels[0].deferredRef, 'kankanews-1')
+  assert.equal(channels[1].logo, 'https://p.statickksmg.com/news.png')
+  assert.ok(channels.every(channel => channel.catchup === 'none'), '纯直播：逐条关掉订阅头的回看声明')
+  assert.ok(channels.every(channel => channel.proxyHls === true))
+})
+
+check('看看新闻：收录上海这一刻 5 路景观直播，并区分同名电视台频道', () => {
+  const channels = buildKankanewsScenicChannels([
+    { id: 15989, title: '陆家嘴', play_url: 'encrypted', cover: 'http://p.statickksmg.com/ljz.jpg' },
+    { id: 13755, title: '外滩观光平台', play_url: 'encrypted' },
+    { id: 12835, title: '魔都眼', play_url: 'encrypted' },
+    { id: 13973, title: '北外滩', play_url: 'encrypted' },
+    { id: 13974, title: '外白渡桥', play_url: 'encrypted' },
+    { id: 99999, title: '临时机位', play_url: 'encrypted' },
+  ])
+  assert.ok(channels.every(channel => channel.catchup === 'none'), '纯直播：逐条关掉订阅头的回看声明')
+  assert.deepEqual(channels.map(channel => channel.name), [
+    '陆家嘴', '外滩观光平台', '魔都眼景观', '北外滩', '外白渡桥',
+  ])
+  assert.equal(channels[0].deferredRef, 'kankanews-scenic-15989')
+  assert.equal(channels[0].logo, 'https://p.statickksmg.com/ljz.jpg')
+  assert.ok(channels.every(channel => channel.proxyHls === true))
+})
+
+check('看看新闻：分块 RSA 公钥还原能跨块拼回完整 HLS 地址，并拒绝坏密文', () => {
+  const { publicKey, privateKey } = generateKeyPairSync('rsa', { modulusLength: 1024 })
+  const plain = 'https://volc-stream.kksmg.com/live/xwzh/index.m3u8?token=' + 'x'.repeat(180)
+  const encrypted = []
+  for (let offset = 0; offset < Buffer.byteLength(plain); offset += 117) {
+    encrypted.push(privateEncrypt({ key: privateKey, padding: constants.RSA_PKCS1_PADDING }, Buffer.from(plain).subarray(offset, offset + 117)))
+  }
+  assert.equal(decryptKankanewsLiveAddress(Buffer.concat(encrypted).toString('base64'), publicKey), plain)
+  assert.throws(() => decryptKankanewsLiveAddress('not-base64!', publicKey), /密文格式/)
+})
+
+await checkAsync('看看新闻：电视与景观两个模块各抓各的表，播放时还原短效地址并复用 150 秒缓存', async () => {
+  clearKankanewsCache()
+  const module = getModule('kankanews')
+  const scenicModule = getModule('kankanews-scenic')
+  const listFetch = async (url, options) => {
+    assert.match(options.headers.sign, /^[a-f0-9]{32}$/)
+    if (String(url) === 'https://kapi.kankanews.com/content/pc/tv/channels') {
+      return fakeResponse({ code: '1000', result: { list: [{ id: 1, name: '东方卫视' }] } })
+    }
+    assert.equal(String(url), 'https://kapi.kankanews.com/content/pc/news/detail?content_id=8029037XEw6')
+    return fakeResponse({ code: '1000', result: {
+      play_info: [{ id: 15989, title: '陆家嘴', play_url: 'encrypted' }],
+    } })
+  }
+  const list = await module.fetch({}, { fetchImpl: listFetch })
+  assert.deepEqual(list.groups.map(group => group.name), ['上海电视台'])
+  assert.deepEqual(list.groups[0].dataList[0].opts, ['network-caching=3000'])
+  const scenicList = await scenicModule.fetch({}, { fetchImpl: listFetch })
+  assert.deepEqual(scenicList.groups.map(group => group.name), ['上海景观'])
+  assert.equal(scenicList.groups[0].dataList[0].deferredRef, 'kankanews-scenic-15989')
+  assert.equal(module.claimsRef('kankanews-scenic-15989'), false)
+  assert.equal(scenicModule.claimsRef('kankanews-scenic-15989'), true)
+  assert.equal(resolverFor('kankanews-scenic-15989'), scenicModule)
+  assert.equal(resolverFor('kankanews-1'), module)
+
+  const { publicKey, privateKey } = generateKeyPairSync('rsa', { modulusLength: 1024 })
+  const startedAt = 1720000000000
+  const tokenPayload = Buffer.from(JSON.stringify({ exp: Math.floor(startedAt / 1000) + 3600 })).toString('base64url')
+  const url = `https://volc-stream.kksmg.com/live/dfws4k/index.m3u8?token=x.${tokenPayload}.x&volcTime=abc`
+  const scenicUrl = `https://live-ws.kksmg.com/live/sdi5/playlist.m3u8?token=x.${tokenPayload}.x&volcTime=def`
+  const encryptUrl = plain => {
+    const encrypted = []
+    for (let offset = 0; offset < Buffer.byteLength(plain); offset += 117) {
+      encrypted.push(privateEncrypt({ key: privateKey, padding: constants.RSA_PKCS1_PADDING }, Buffer.from(plain).subarray(offset, offset + 117)))
+    }
+    return Buffer.concat(encrypted).toString('base64')
+  }
+  let channelCalls = 0
+  let scenicCalls = 0
+  const fetchImpl = async requestUrl => {
+    if (/channel\/detail\?channel_id=1$/.test(String(requestUrl))) {
+      channelCalls++
+      return fakeResponse({ code: '1000', result: {
+        id: 1, name: '东方卫视', limit_time: 180,
+        live_address: encryptUrl(url),
+      } })
+    }
+    scenicCalls++
+    assert.match(String(requestUrl), /news\/detail\?content_id=8029037XEw6$/)
+    return fakeResponse({ code: '1000', result: {
+      limit_time: 180,
+      play_info: [{ id: 15989, title: '陆家嘴', play_url: encryptUrl(scenicUrl) }],
+    } })
+  }
+  const first = await resolveKankanewsChannel('kankanews-1', {
+    now: startedAt, publicKey, fetchImpl, nonce: 'abcd1234',
+  })
+  const cached = await resolveKankanewsChannel('kankanews-1', {
+    now: startedAt + 1000, publicKey, fetchImpl, nonce: 'abcd1234',
+  })
+  assert.equal(first.url, url)
+  assert.equal(cached.url, url)
+  assert.equal(channelCalls, 1, '播放器轮询清单时不能每次都重打频道详情接口')
+  assert.equal(first.upstreamHeaders.Origin, 'https://live.kankanews.com')
+  assert.equal(first.upstreamHeaders.Referer, 'https://live.kankanews.com/huikan')
+
+  const scenicFirst = await resolveKankanewsChannel('kankanews-scenic-15989', {
+    now: startedAt, publicKey, fetchImpl, nonce: 'abcd1234',
+  })
+  const scenicCached = await resolveKankanewsChannel('kankanews-scenic-15989', {
+    now: startedAt + 1000, publicKey, fetchImpl, nonce: 'abcd1234',
+  })
+  assert.equal(scenicFirst.url, scenicUrl)
+  assert.equal(scenicCached.url, scenicUrl)
+  assert.equal(scenicCalls, 1, '景观线路共用详情接口，播放器轮询时必须复用缓存')
+})
+
+// ---- 福建海博TV ----
+
+const fjtvRow = (id, title, sortId, path, extra = {}) => ({
+  id,
+  title,
+  sort_id: sortId,
+  indexpic: `https://fyfile.fjtv.net/file/${id}.png`,
+  topic_camera: [{
+    // 这个字段在真实「福建综合」行里曾指向无关频道，测试确保实现不会读取它。
+    extra: { play_stream_url: 'https://stream3.fjtv.net/cctv1hd/hd/live.m3u8' },
+    streams: [{ hls: `https://live4-fuyun.fjtv.net/${path}/live.m3u8` }],
+  }],
+  ...extra,
+})
+
+const fjtvProvinceSort = '665226484478443521'
+const fjtvCitySort = '665226484646215680'
+const fjtvProvinceRows = () => [
+  fjtvRow('665248990102917120', '综合频道', fjtvProvinceSort, 'zhpd/hd'),
+  fjtvRow('665248966136664064', '东南卫视', fjtvProvinceSort, 'dnpd/hd'),
+  fjtvRow('665248914378952704', '新闻频道', fjtvProvinceSort, 'xwpd/hd'),
+  fjtvRow('665248752898248704', '文旅·体育频道', fjtvProvinceSort, 'dspd/hd'),
+  fjtvRow('665248553475870720', '少儿频道', fjtvProvinceSort, 'child/hd'),
+  fjtvRow('665248523855695872', '海峡卫视', fjtvProvinceSort, 'haixiapd/hd'),
+]
+const fjtvCityRows = () => [
+  fjtvRow('727571808803282944', '厦门卫视', fjtvCitySort, 'hb_xmtv/sd'),
+  fjtvRow('731087090473676800', '福州新闻综合频道', fjtvCitySort, 'hb_fztv/sd'),
+  fjtvRow('727214415649083392', '漳州新闻综合频道', fjtvCitySort, 'hb_zztv/sd'),
+  fjtvRow('727216678547394560', '三明综合频道', fjtvCitySort, 'hb_smtv/sd'),
+  fjtvRow('727572738755977216', '泉州新闻综合频道', fjtvCitySort, 'hb_qztv/sd'),
+  fjtvRow('727216450918322176', '南平综合频道', fjtvCitySort, 'hb_nptv/sd'),
+  fjtvRow('727212352215093248', '龙岩综合频道', fjtvCitySort, 'hb_lytv/sd'),
+  fjtvRow('727213694589505536', '莆田新闻综合频道', fjtvCitySort, 'hb_puttv/sd'),
+  fjtvRow('727574414028103680', '平潭综合频道', fjtvCitySort, 'hb_pttv/sd'),
+  fjtvRow('727213159174017024', '宁德新闻综合频道', fjtvCitySort, 'hb_ndtv/sd'),
+]
+
+const fjtvProvinceApiRow = definition => ({
+  id: definition.id,
+  name: definition.rawName,
+  m3u8: `https://live2-fuyun.fjtv.net/${definition.path}/live.m3u8?_upt=deadbeef1999999999`,
+  channel_stream: [{
+    is_main: 1,
+    m3u8: `https://live1-fuyun.fjtv.net/${definition.path}/live.m3u8?_upt=deadbeef1999999999`,
+  }],
+})
+
+const fakeProvinceFetch = async (requestUrl, options) => {
+  const url = new URL(String(requestUrl))
+  assert.equal(url.origin + url.pathname, 'https://live.fjtv.net/m2o/channel/channel_info.php')
+  assert.equal(options.headers['User-Agent'], 'node')
+  const timestamp = options.headers['X-API-TIMESTAMP']
+  const signature = createHash('md5')
+    .update(['877a9ba7a98f75b90a9d49f53f15a858', '68a04b8177bdc9e5e16a89e6777a7b66', '1.0.0', timestamp].join('&'))
+    .digest('hex')
+  assert.equal(options.headers['X-API-SIGNATURE'], signature)
+  const definition = PROVINCE_CHANNELS.find(channel => channel.id === url.searchParams.get('channel_id'))
+  return fakeResponse(definition ? [fjtvProvinceApiRow(definition)] : [])
+}
+
+const xiamenRow = definition => ({
+  id: Number(definition.id),
+  name: definition.rawNames[0],
+  m3u8: `https://${definition.id === '18' ? 'live4' : 'live1'}.kxm.xmtv.cn/${definition.path}/playlist.m3u8?_upt=deadbeef1999999999`,
+  logo: {
+    square_1: {
+      host: 'https://img1.kxm.xmtv.cn/',
+      filename: `${definition.id}.png`,
+    },
+  },
+  channel_stream: [{
+    is_main: 1,
+    m3u8: `https://${definition.id === '18' ? 'live4' : 'live1'}.kxm.xmtv.cn/${definition.path}/main/live.m3u8?_upt=deadbeef1999999999`,
+  }],
+})
+
+const fakeXiamenFetch = async (requestUrl, options, { failManifestId = '' } = {}) => {
+  const url = new URL(String(requestUrl))
+  assert.equal(options.headers.Referer, 'https://www.xmtv.cn/')
+  if (url.hostname === 'mapi1.kxm.xmtv.cn') {
+    const definition = XIAMEN_CHANNELS.find(channel => channel.id === url.searchParams.get('channel_id'))
+    return fakeResponse(definition ? [xiamenRow(definition)] : [])
+  }
+  const definition = XIAMEN_CHANNELS.find(channel => url.pathname.startsWith(`/${channel.path}/`))
+  if (definition?.id === failManifestId) return { ok: false, status: 503 }
+  return fakeResponse('#EXTM3U\n#EXT-X-TARGETDURATION:6\nsegment.ts\n')
+}
+
+check('福建：只读取官方 streams[].hls，不使用错误备用字段或外站地址', () => {
+  assert.equal(
+    fjtvHlsOf(fjtvProvinceRows()[0]),
+    'https://live4-fuyun.fjtv.net/zhpd/hd/live.m3u8',
+  )
+  assert.equal(fjtvHlsOf({
+    topic_camera: [{
+      extra: { play_stream_url: 'https://stream3.fjtv.net/wrong/live.m3u8' },
+      streams: [{ hls: 'https://example.com/fake/live.m3u8' }],
+    }],
+  }), '')
+  assert.equal(fjtvHlsOf({
+    topic_camera: [{ streams: [{ hls: 'http://live1-fuyun.fjtv.net/xwpd/hd/live.m3u8' }] }],
+  }), '')
+})
+
+check('福建：固定输出6个动态省级与9个海博地市频道，排除重复低清厦门卫视', () => {
+  const groups = [buildProvinceGroup(), ...buildFjtvGroups([
+    { sortId: fjtvCitySort, rows: fjtvCityRows() },
+  ])]
+  assert.deepEqual(groups.map(group => group.name), ['福建电视台', '福建地市台'])
+  assert.deepEqual(
+    groups[0].dataList.map(channel => channel.name),
+    ['福建综合', '东南卫视', '福建新闻', '福建文旅体育', '福建少儿', '海峡卫视'],
+  )
+  assert.ok(groups.flatMap(group => group.dataList).every(channel => channel.catchup === 'none'), '纯直播：逐条关掉订阅头的回看声明')
+  assert.deepEqual(
+    groups[1].dataList.map(channel => channel.name),
+    ['福州新闻综合', '漳州新闻综合', '三明综合', '泉州新闻综合', '南平综合', '龙岩综合', '莆田新闻综合', '平潭综合', '宁德新闻综合'],
+  )
+  assert.ok(groups[0].dataList.every(channel =>
+    channel.relayHls === true && /^fjtv-province-\d{18}$/.test(channel.deferredRef) && !channel.url))
+  assert.ok(groups[1].dataList.every(channel =>
+    !channel.proxyHls && !channel.relayHls && !channel.deferredRef))
+})
+
+await checkAsync('福建：省级频道播放时签名、复用有效地址并只中继清单', async () => {
+  clearProvinceCache()
+  let apiCalls = 0
+  const fetchImpl = async (url, options) => {
+    apiCalls++
+    return fakeProvinceFetch(url, options)
+  }
+  const ref = 'fjtv-province-665248990102917120'
+  const first = await resolveProvinceChannel(ref, { fetchImpl, now: 1900000000000 })
+  const second = await resolveProvinceChannel(ref, { fetchImpl, now: 1900000001000 })
+  assert.equal(apiCalls, 1, '未过期的省级短效地址应复用，不能随播放器轮询反复打接口')
+  assert.equal(first.url, second.url)
+  assert.equal(first.relayHls, true)
+  assert.match(first.url, /^https:\/\/live1-fuyun\.fjtv\.net\/zhpd\/hd\/live\.m3u8\?_upt=/)
+
+  clearProvinceCache()
+  const rejected = await resolveProvinceChannel(ref, { fetchImpl: async () => fakeResponse([{
+    ...fjtvProvinceApiRow(PROVINCE_CHANNELS[0]),
+    name: '错误频道名',
+  }]), now: 1900000000000 })
+  assert.equal(rejected.url, '')
+  assert.match(rejected.desc, /频道身份与官方白名单不一致/)
+})
+
+check('福建：福州三路替换原单路并留在既有福建地市台分组', () => {
+  const groups = mergeFuzhouChannels([buildProvinceGroup(), ...buildFjtvGroups([
+    { sortId: fjtvCitySort, rows: fjtvCityRows() },
+  ])], FUZHOU_CHANNELS)
+  assert.deepEqual(groups.map(group => group.name), ['福建电视台', '福建地市台'])
+  assert.deepEqual(
+    groups[1].dataList.slice(0, 5).map(channel => channel.name),
+    ['福州综合', '福州生活', '福州少儿', '漳州新闻综合', '三明综合'],
+  )
+  assert.equal(groups[1].dataList.length, 11)
+  assert.ok(!groups[1].dataList.some(channel => channel.name === '福州新闻综合'))
+
+  const fallbackOnly = mergeFuzhouChannels([], FUZHOU_CHANNELS)
+  assert.deepEqual(fallbackOnly.map(group => group.name), ['福建地市台'])
+  assert.deepEqual(fallbackOnly[0].dataList.map(channel => channel.name), ['福州综合', '福州生活', '福州少儿'])
+})
+
+check('福建：排除厦门卫视，只把厦门三个地面频道并入原地市分组', () => {
+  const xiamen = XIAMEN_CHANNELS.map(channel => ({
+    name: channel.name,
+    deferredRef: `fjtv-xiamen-${channel.id}`,
+    proxyHls: true,
+  }))
+  const withXiamen = mergeXiamenChannels([buildProvinceGroup(), ...buildFjtvGroups([
+    { sortId: fjtvCitySort, rows: fjtvCityRows() },
+  ])], xiamen)
+  assert.deepEqual(
+    withXiamen[1].dataList.slice(0, 4).map(channel => channel.name),
+    ['厦视一套', '厦视二套', '厦视三套', '福州新闻综合'],
+  )
+  assert.equal(withXiamen[1].dataList.length, 12)
+
+  const merged = mergeFuzhouChannels(withXiamen, FUZHOU_CHANNELS)
+  assert.deepEqual(
+    merged[1].dataList.slice(0, 7).map(channel => channel.name),
+    ['厦视一套', '厦视二套', '厦视三套', '福州综合', '福州生活', '福州少儿', '漳州新闻综合'],
+  )
+  assert.equal(merged[1].dataList.length, 14)
+
+  const fallbackOnly = mergeFuzhouChannels(mergeXiamenChannels([], xiamen), FUZHOU_CHANNELS)
+  assert.deepEqual(fallbackOnly[0].dataList.map(channel => channel.name), [
+    '厦视一套', '厦视二套', '厦视三套', '福州综合', '福州生活', '福州少儿',
+  ])
+})
+
+await checkAsync('福建：福州固定官方 HLS 逐路探测，单路失败不会拖掉其余频道', async () => {
+  const calls = []
+  const result = await fetchFuzhouChannels({ fetchImpl: async (requestUrl, options) => {
+    const url = new URL(String(requestUrl))
+    calls.push(url.href)
+    assert.equal(url.hostname, 'live.zohi.tv')
+    assert.equal(options.headers.Referer, 'https://www.zohi.tv/')
+    if (url.pathname.includes('fztv-3')) return { ok: false, status: 503 }
+    return fakeResponse('#EXTM3U\n#EXT-X-TARGETDURATION:6\n')
+  } })
+  assert.deepEqual(calls, FUZHOU_CHANNELS.map(channel => channel.url))
+  assert.deepEqual(result.channels.map(channel => channel.name), ['福州综合', '福州少儿'])
+  // 直链频道：播放器会把订阅头的回看参数直接接到官方地址后面，逐条关掉
+  assert.ok(result.channels.every(channel => channel.catchup === 'none'))
+  assert.match(result.warnings[0], /福州生活探测失败：HTTP 503/)
+  // 台标来自官网播放器频道列表的 icon，三路各不相同
+  assert.ok(FUZHOU_CHANNELS.every(channel => /^https:\/\/img\.zohi\.tv\/a\/10001\/\d{6}\/[0-9a-f]{32}\.jpe?g$/.test(channel.logo)))
+  assert.equal(new Set(FUZHOU_CHANNELS.map(channel => channel.logo)).size, FUZHOU_CHANNELS.length)
+  assert.deepEqual(result.channels.map(channel => channel.logo), [FUZHOU_CHANNELS[0].logo, FUZHOU_CHANNELS[2].logo])
+
+  await assert.rejects(
+    () => fetchFuzhouChannels({ fetchImpl: async () => fakeResponse('<html>not hls</html>') }),
+    /三路直播全部不可用.*不是 HLS 清单/,
+  )
+})
+
+await checkAsync('福建：厦门官方接口严格选三路，探测失败只跳过单路', async () => {
+  clearXiamenCache()
+  const result = await fetchXiamenChannels({
+    fetchImpl: (url, options) => fakeXiamenFetch(url, options, { failManifestId: '17' }),
+  })
+  assert.deepEqual(result.channels.map(channel => channel.name), ['厦视一套', '厦视三套'])
+  assert.ok(result.channels.every(channel => channel.proxyHls === true && /^fjtv-xiamen-/.test(channel.deferredRef)))
+  assert.ok(result.channels.every(channel => channel.catchup === 'none'), '纯直播：逐条关掉订阅头的回看声明')
+  assert.match(result.warnings[0], /厦视二套探测失败：HTTP 503/)
+})
+
+await checkAsync('福建：厦门播放时刷新短效地址，并全代理官网 Referer', async () => {
+  clearXiamenCache()
+  let apiCalls = 0
+  const fetchImpl = async (url, options) => {
+    apiCalls++
+    return fakeXiamenFetch(url, options)
+  }
+  const first = await resolveXiamenChannel('fjtv-xiamen-16', { fetchImpl, now: 1900000000000 })
+  const second = await resolveXiamenChannel('fjtv-xiamen-16', { fetchImpl, now: 1900000001000 })
+  assert.equal(apiCalls, 1, '未过期的短效地址应复用，避免每个播放器请求都打官方接口')
+  assert.equal(first.url, second.url)
+  assert.equal(first.proxyHls, true)
+  assert.equal(first.upstreamHeaders.Referer, 'https://www.xmtv.cn/')
+  assert.match(first.url, /^https:\/\/live1\.kxm\.xmtv\.cn\/xmtjs1\/main\/live\.m3u8\?_upt=/)
+})
+
+await checkAsync('福建：仍用一个模块和原有两组；海博地市失败不影响动态省级与独立六路', async () => {
+  const module = getModule('fjtv')
+  clearXiamenCache()
+  const calls = []
+  const fetchImpl = async (requestUrl, options) => {
+    const url = new URL(String(requestUrl))
+    if (url.hostname === 'mapi1.kxm.xmtv.cn' || /^live\d+\.kxm\.xmtv\.cn$/.test(url.hostname)) {
+      return fakeXiamenFetch(requestUrl, options)
+    }
+    if (url.hostname === 'live.zohi.tv') {
+      assert.equal(options.headers.Referer, 'https://www.zohi.tv/')
+      return fakeResponse('#EXTM3U\n#EXT-X-TARGETDURATION:6\n')
+    }
+    calls.push(url.searchParams.get('sort_id'))
+    assert.equal(url.origin + url.pathname, 'https://mapi-plus.fjtv.net/api/open/haibo8/tv_channel_list.php')
+    assert.equal(options.headers.Referer, 'https://www.fjtv.net/')
+    return fakeResponse(fjtvCityRows())
+  }
+  const result = await module.fetch({}, { fetchImpl })
+  assert.deepEqual(calls, [fjtvCitySort])
+  assert.equal(result.groups[0].dataList.length, 6)
+  assert.equal(result.groups[1].dataList.length, 14)
+  assert.deepEqual(result.meta.warnings, [])
+
+  clearXiamenCache()
+  const fallback = await module.fetch({}, { fetchImpl: async (requestUrl, options) => {
+    const url = new URL(String(requestUrl))
+    if (url.hostname === 'mapi1.kxm.xmtv.cn' || /^live\d+\.kxm\.xmtv\.cn$/.test(url.hostname)) {
+      return fakeXiamenFetch(requestUrl, options)
+    }
+    if (url.hostname === 'live.zohi.tv') return fakeResponse('#EXTM3U\n#EXT-X-TARGETDURATION:6\n')
+    return fakeResponse(fjtvCityRows().slice(2))
+  } })
+  assert.deepEqual(fallback.groups.map(group => group.name), ['福建电视台', '福建地市台'])
+  assert.deepEqual(fallback.groups[1].dataList.map(channel => channel.name), [
+    '厦视一套', '厦视二套', '厦视三套', '福州综合', '福州生活', '福州少儿',
+  ])
+  assert.match(fallback.meta.warnings[0], /只找到 8\/9 个正式频道/)
+
+  clearXiamenCache()
+  const provinceOnly = await module.fetch({}, { fetchImpl: async () => ({ ok: false, status: 403 }) })
+  assert.deepEqual(provinceOnly.groups.map(group => group.name), ['福建电视台'])
+  assert.equal(provinceOnly.groups[0].dataList.length, 6)
+  assert.ok(provinceOnly.groups[0].dataList.every(channel => channel.relayHls === true))
+  assert.ok(provinceOnly.meta.warnings.some(warning => /海博TV.*HTTP 403/.test(warning)))
+})
+
+// ---- 海南网络广播电视台 ----
+
+const hnntvRows = () => [
+  { id: 13, name: '海南卫视', code: 'STHaiNan_channel_lywsgq', type: 1, liveUrl: 'https://live2.hnntv.cn/srs/tv/lywsgq.m3u8' },
+  { id: 5, name: '三沙卫视', code: 'STHaiNan_channel_ssws', type: 1, liveUrl: 'https://livessws.hnntv.cn/live/ssws_260111hnntv.m3u8' },
+  { id: 1, name: '海南自贸', code: 'jjpd', type: 1, liveUrl: 'https://live2.hnntv.cn/srs/tv/jjpd.m3u8' },
+  { id: 3, name: '海南新闻', code: 'STHaiNan_channel_xwpd', type: 1, liveUrl: 'https://live2.hnntv.cn/srs/tv/xwpd.m3u8' },
+  { id: 4, name: '海南社会与法', code: 'ggpd', type: 1, liveUrl: 'https://live2.hnntv.cn/srs/tv/ggpd.m3u8' },
+  { id: 6, name: '海南文旅', code: 'wlpd', type: 1, liveUrl: 'https://live2.hnntv.cn/srs/tv/wlpd.m3u8' },
+  { id: 7, name: '海南少儿', code: 'sepd', type: 1, liveUrl: 'https://live2.hnntv.cn/srs/tv/sepd.m3u8' },
+]
+
+check('海南：只输出固定七套电视，保持官网顺序并拒绝身份错配', () => {
+  const rows = hnntvRows()
+  rows.reverse()
+  rows.push(
+    { id: 8, name: '海南交通广播', code: 'jtgb', type: 2, liveUrl: 'https://live2.hnntv.cn/srs/radio/jtgb.m3u8' },
+    { id: 13, name: '伪造卫视', code: 'STHaiNan_channel_lywsgq', type: 1, liveUrl: 'https://live2.hnntv.cn/srs/tv/lywsgq.m3u8' },
+    { id: 5, name: '三沙卫视', code: 'wrong', type: 1, liveUrl: 'https://example.com/ssws.m3u8' },
+  )
+  const channels = buildHnntvChannels(rows)
+  assert.deepEqual(channels.map(channel => channel.name), [
+    '海南卫视', '三沙卫视', '海南自贸', '海南新闻', '海南社会与法', '海南文旅', '海南少儿',
+  ])
+  assert.ok(channels.every(channel => channel.catchup === 'none'), '纯直播：逐条关掉订阅头的回看声明')
+  assert.deepEqual(channels.map(channel => channel.deferredRef), [
+    'hnntv-13', 'hnntv-5', 'hnntv-1', 'hnntv-3', 'hnntv-4', 'hnntv-6', 'hnntv-7',
+  ])
+  assert.ok(channels.every(channel => !channel.proxyHls && !channel.relayHls))
+  // 台标是视听海南 App 频道列表的圆标，按 App 图片基址拼成完整 https 地址，七套各不相同
+  assert.equal(channels[0].logo,
+    'https://img-app.hnntv.cn/resource/upload/image/media/2023-09-03/94fb34ba-3474-4b48-aa32-0a4a61721af3.png')
+  assert.ok(channels.every(channel =>
+    /^https:\/\/img-app\.hnntv\.cn\/resource\/upload\/image\/media\/\d{4}-\d{2}-\d{2}\/[0-9a-f-]{36}\.png$/.test(channel.logo)))
+  assert.equal(new Set(channels.map(channel => channel.logo)).size, 7)
+})
+
+await checkAsync('海南：抓取七套频道，播放时签名并在有效期内复用地址', async () => {
+  clearHnntvCache()
+  const startedAt = 1720000000000
+  const signedUrl = 'https://live2.hnntv.cn/srs/tv/lywsgq.m3u8?_upt=deadbeef1720007200'
+  let listCalls = 0
+  let playCalls = 0
+  const fetchImpl = async (requestUrl, options = {}) => {
+    const url = new URL(String(requestUrl))
+    assert.equal(options.headers.Origin, 'https://www.hnntv.cn')
+    if (url.hostname === 'www.hnntv.cn') {
+      listCalls++
+      assert.equal(url.searchParams.get('type'), '1')
+      return fakeResponse({ businessCode: '00000', resultSet: hnntvRows() })
+    }
+    playCalls++
+    assert.equal(url.hostname, 'ps.hnntv.cn')
+    assert.equal(url.searchParams.get('channelCode'), 'STHaiNan_channel_lywsgq')
+    assert.equal(url.searchParams.get('appCode'), '')
+    assert.equal(url.searchParams.get('token'), '')
+    return fakeResponse({ businessCode: 200, resultSet: [{ url: signedUrl }] })
+  }
+
+  const module = getModule('hnntv')
+  const result = await module.fetch({}, { fetchImpl, now: startedAt })
+  assert.equal(result.groups[0].name, '海南电视台')
+  assert.equal(result.groups[0].dataList.length, 7)
+
+  const first = await resolveHnntvChannel('hnntv-13', { fetchImpl, now: startedAt + 1000 })
+  const cached = await resolveHnntvChannel('hnntv-13', { fetchImpl, now: startedAt + 2000 })
+  assert.equal(first.url, signedUrl)
+  assert.equal(cached.url, signedUrl)
+  assert.equal(first.upstreamHeaders, undefined)
+  assert.equal(listCalls, 1)
+  assert.equal(playCalls, 1)
+})
+
+await checkAsync('海南：频道列表接口常要 12～13 秒才回，等 20 秒，不跟随通用的单次请求超时', async () => {
+  assert.equal(HNNTV_LIST_TIMEOUT_MS, 20 * 1000)
+  clearHnntvCache()
+  // 管理器给每个模块传 timeoutMs:10000；这里把它压到 50ms，接口 150ms 才回，照样要抓到
+  const fetchImpl = async (requestUrl, options = {}) => {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(resolve, 150)
+      options.signal?.addEventListener('abort', () => { clearTimeout(timer); reject(Object.assign(new Error('aborted'), { name: 'AbortError' })) })
+    })
+    return fakeResponse({ businessCode: '00000', resultSet: hnntvRows() })
+  }
+  const result = await getModule('hnntv').fetch({}, { fetchImpl, timeoutMs: 50, now: 1720000000000 })
+  assert.equal(result.groups[0].dataList.length, 7)
+  clearHnntvCache()
+})
+
+// ---- 河南大象新闻 ----
+
+check('河南：官网请求实际使用 SHA-256（不是 MD5）且时间戳为秒', () => {
+  const now = 1720000000123
+  const headers = buildHntvSignedHeaders(now)
+  assert.equal(headers.timestamp, '1720000000')
+  assert.equal(
+    headers.sign,
+    createHash('sha256').update('6ca114a836ac7d731720000000').digest('hex'),
+  )
+  assert.equal(headers.sign.length, 64)
+})
+
+check('河南：只输出固定正式频道、规范名称并排除购物与 ID/名称错配', () => {
+  const expiry = Math.floor(Date.now() / 1000) + 14400
+  const stream = id => `http://tvcdn.stream3.hndt.com/tv/${id}/playlist.m3u8?wsSecret=x&wsTime=${expiry}`
+  const channels = buildHntvChannels([
+    { cid: 145, name: '河南卫视', image: '/a.png', video_streams: [stream('ws')] },
+    { cid: 149, name: '新闻频道', image: '/b.png', video_streams: [stream('news')] },
+    { cid: 150, name: '欢腾购物', video_streams: [stream('shopping')] },
+    { cid: 141, name: '伪造频道', video_streams: [stream('wrong')] },
+  ])
+  assert.deepEqual(channels.map(channel => channel.name), ['河南卫视', '河南新闻'])
+  assert.deepEqual(channels.map(channel => channel.deferredRef), ['hntv-145', 'hntv-149'])
+  assert.ok(channels.every(channel => channel.catchup === 'none'), '纯直播：逐条关掉订阅头的回看声明')
+  assert.ok(channels.every(channel => !channel.proxyHls && !channel.relayHls))
+})
+
+check('河南：接口 image 相对路径按官网图床拼完整，缺图留空', () => {
+  const expiry = Math.floor(Date.now() / 1000) + 14400
+  const stream = id => `http://tvcdn.stream3.hndt.com/tv/${id}/playlist.m3u8?wsSecret=x&wsTime=${expiry}`
+  const channels = buildHntvChannels([
+    { cid: 145, name: '河南卫视', image: '/anonymous/2020/9/18/1306760236945772544.png', logo: '', video_streams: [stream('ws')] },
+    { cid: 149, name: '新闻频道', image: '', logo: '', video_streams: [stream('news')] },
+    { cid: 141, name: '都市频道', image: 'javascript:alert(1)', video_streams: [stream('ds')] },
+  ])
+  assert.deepEqual(channels.map(channel => channel.logo), [
+    'https://cmsres.dianzhenkeji.com/anonymous/2020/9/18/1306760236945772544.png',
+    '',
+    '',
+  ])
+})
+
+await checkAsync('河南：模块用签名频道接口取流，缓存后播放不重复联网', async () => {
+  clearHntvCache()
+  const startedAt = 1720000000000
+  const expiry = Math.floor(startedAt / 1000) + 14400
+  const rows = [
+    {
+      cid: 145, name: '河南卫视', image: '/anonymous/ws.png',
+      video_streams: [`http://tvcdn.stream3.hndt.com/tv/ws/playlist.m3u8?wsSecret=x&wsTime=${expiry}`],
+    },
+    {
+      cid: 149, name: '新闻频道', image: '/anonymous/news.png',
+      video_streams: [`http://tvcdn.stream3.hndt.com/tv/news/playlist.m3u8?wsSecret=y&wsTime=${expiry}`],
+    },
+    {
+      cid: 150, name: '欢腾购物', image: '/anonymous/shop.png',
+      video_streams: [`http://tvcdn.stream3.hndt.com/tv/shop/playlist.m3u8?wsSecret=z&wsTime=${expiry}`],
+    },
+  ]
+  let calls = 0
+  const fetchImpl = async (_url, options) => {
+    calls++
+    assert.equal(options.headers.timestamp, '1720000000')
+    assert.equal(options.headers.sign.length, 64)
+    assert.equal(options.headers.Origin, 'https://static.hntv.tv')
+    return fakeResponse(rows)
+  }
+  const module = getModule('hntv')
+  const result = await module.fetch({}, { fetchImpl, now: startedAt })
+  assert.deepEqual(result.groups[0].dataList.map(channel => channel.name), ['河南卫视', '河南新闻'])
+
+  const resolved = await resolveHntvChannel('hntv-145', {
+    now: startedAt + 1000,
+    fetchImpl: async () => { throw new Error('有效缓存内不应联网') },
+  })
+  assert.match(resolved.url, /^https:\/\/tvcdn\.stream3\.hndt\.com\//)
+  assert.equal(resolved.upstreamHeaders, undefined)
+  assert.equal(calls, 1)
+})
+
+// ---- 山东齐鲁网 ----
+
+const iqiluPage = (id, name) => `
+  <script>var _pdCid = "${id}"; var _pdName = "${name}";</script>
+  <script>
+    var dF = 'https://feiying.litenews.cn/api/';
+    var aF = 'v1/auth/exchange';
+    var mxpx = 'QZMVKTRHPLXADJNE';
+    var aly = 'BWRFYSNCOGIXUTPA';
+  </script>`
+
+check('山东：从官方频道页提取频道 ID 与鉴权参数，并拒绝伪造接口', () => {
+  const definition = { slug: 'qlpd', name: '齐鲁频道', pageName: '齐鲁频道', logo: '' }
+  const row = parseIqiluChannelPage(iqiluPage('24584', '齐鲁频道'), definition)
+  assert.equal(row.id, '24584')
+  assert.equal(row.auth.endpoint, 'https://feiying.litenews.cn/api/v1/auth/exchange')
+  assert.throws(
+    () => parseIqiluChannelPage(iqiluPage('24584', '错误频道'), definition),
+    /频道名不符合预期/,
+  )
+  assert.throws(
+    () => parseIqiluChannelPage(iqiluPage('24584', '齐鲁频道').replace('feiying.litenews.cn', 'example.com'), definition),
+    /鉴权参数不符合预期/,
+  )
+})
+
+check('山东：exchange 请求与官网 MD5 + AES-128-CBC 算法一致', () => {
+  const row = parseIqiluChannelPage(
+    iqiluPage('24584', '齐鲁频道'),
+    { slug: 'qlpd', name: '齐鲁频道', pageName: '齐鲁频道', logo: '' },
+  )
+  const now = 1720000000123
+  const request = buildIqiluExchangeRequest(row, now)
+  const url = new URL(request.url)
+  assert.equal(url.searchParams.get('t'), String(now))
+  assert.equal(
+    url.searchParams.get('s'),
+    createHash('md5').update(`24584${now}QZMVKTRHPLXADJNE`).digest('hex'),
+  )
+
+  const key = Buffer.from('BWRFYSNCOGIXUTPA')
+  const decipher = createDecipheriv('aes-128-cbc', key, Buffer.alloc(16, 0x30))
+  const plain = Buffer.concat([decipher.update(request.body, 'base64'), decipher.final()]).toString('utf8')
+  assert.equal(plain, JSON.stringify({ channelMark: '24584' }))
+})
+
+await checkAsync('山东：九个官方频道全部加入，播放鉴权结果按频道复用且不声明全代理', async () => {
+  clearIqiluCache()
+  const pages = {
+    sdtv: ['24581', '山东卫视'], qlpd: ['24584', '齐鲁频道'], ggpd: ['24602', '新闻频道'],
+    typd: ['24587', '体育休闲频道'], shpd: ['24596', '生活频道'], zypd: ['24593', '综艺频道'],
+    nkpd: ['24599', '农科频道'], yspd: ['24590', '文旅频道'], sepd: ['24605', '少儿频道'],
+  }
+  let exchangeCalls = 0
+  const streamUrl = 'https://tstreamlive302.iqilu.com/21/test/playlist.m3u8?k=x&t=1'
+  const encryptedResponse = () => {
+    const cipher = createCipheriv(
+      'aes-128-cbc',
+      Buffer.from('BWRFYSNCOGIXUTPA'),
+      Buffer.alloc(16, 0x30),
+    )
+    return Buffer.concat([
+      cipher.update(JSON.stringify({ code: 1, data: streamUrl })),
+      cipher.final(),
+    ]).toString('base64')
+  }
+  const fetchImpl = async (requestUrl, options = {}) => {
+    const url = new URL(String(requestUrl))
+    if (url.hostname === 'v.iqilu.com') {
+      const slug = url.pathname.split('/').filter(Boolean).pop()
+      const row = pages[slug]
+      assert.ok(row, `未预期频道页 ${slug}`)
+      return { ok: true, status: 200, text: async () => iqiluPage(row[0], row[1]) }
+    }
+    exchangeCalls++
+    assert.equal(options.method, 'POST')
+    assert.equal(options.headers['Content-Type'], 'text/plain')
+    assert.equal(options.headers.Origin, 'https://v.iqilu.com')
+    return { ok: true, status: 200, text: async () => encryptedResponse() }
+  }
+
+  const module = getModule('iqilu')
+  const result = await module.fetch({}, { fetchImpl })
+  assert.deepEqual(
+    result.groups[0].dataList.map(channel => channel.name),
+    ['山东卫视', '齐鲁频道', '山东新闻', '山东体育休闲', '山东生活', '山东综艺', '山东农科', '山东文旅', '山东少儿'],
+  )
+  assert.ok(result.groups[0].dataList.every(channel => !channel.proxyHls && !channel.relayHls))
+  assert.ok(result.groups[0].dataList.every(channel => channel.catchup === 'none'), '纯直播：逐条关掉订阅头的回看声明')
+
+  const first = await resolveIqiluChannel('iqilu-qlpd', { fetchImpl, now: 1720000000123 })
+  const cached = await resolveIqiluChannel('iqilu-qlpd', { fetchImpl, now: 1720000001123 })
+  assert.equal(first.url, streamUrl)
+  assert.equal(cached.url, streamUrl)
+  assert.equal(exchangeCalls, 1)
+  assert.equal(first.upstreamHeaders, undefined)
+  assert.deepEqual(decryptIqiluExchangeResponse(encryptedResponse(), 'BWRFYSNCOGIXUTPA'), { code: 1, data: streamUrl })
+})
+
+// ---- 江苏网络台 ----
+
+check('江苏：Web 鉴权签名与官网算法固定样本一致', () => {
+  const request = buildJstvAuthRequest(1720000000000, '0123456789abcdef0123456789abcdef')
+  assert.equal(request.body.platform, 41)
+  assert.equal(request.body.appId, '3b93c452b851431c8b3a076789ab1e14')
+  assert.match(request.url, /TT=-235964777/)
+  assert.match(request.url, /Sign=d66d6d8c6ab4cec57f79653449c88013/)
+})
+
+check('江苏：短效 HLS 签名与 2026-11-09 官网样本一致，切换网页域名并保留路径', () => {
+  const signed = signJstvStreamUrl(
+    'https://litchi-play-encrypted.jstv.com/applive/jswspro.m3u8',
+    1720000000000,
+  )
+  assert.equal(
+    signed,
+    'https://litchi-play-encrypted-site.jstv.com/applive/jswspro.m3u8?txSecret=35db8bdc7c1b91f9afa6ee73f424a584&txTime=66851eb4',
+  )
+})
+
+check('江苏：4K 与普通频道默认全部加入且走全代理', () => {
+  const rows = [
+    { id: '670', name: '江苏卫视', url: 'https://x.jstv.com/applive/jswspro.m3u8', logo: 'a.png' },
+    { id: '676', name: '江苏卫视4K', url: 'https://x.jstv.com/4klive/jsws4kpro.m3u8', logo: 'b.png' },
+  ]
+  const channels = buildJstvChannels(rows)
+  assert.deepEqual(channels.map(x => x.name), ['江苏卫视', '江苏卫视4K'])
+  assert.equal(channels[0].deferredRef, 'jstv-670')
+  assert.ok(channels.every(x => x.proxyHls === true))
+  assert.ok(channels.every(channel => channel.catchup === 'none'), '纯直播：逐条关掉订阅头的回看声明')
+})
+
+await checkAsync('江苏：模块取 Bearer 频道表，缓存后播放时签名并声明防盗链请求头', async () => {
+  clearJstvCache()
+  const futureExp = Math.floor(Date.now() / 1000) + 600
+  const token = `x.${Buffer.from(JSON.stringify({ exp: futureExp })).toString('base64url')}.x`
+  const articles = [
+    {
+      title: '江苏卫视', extraId: '670', thumbnailsJson: ['https://images.jstv.com/jsws.png'],
+      extraJson: { url: 'https://litchi-play-encrypted.jstv.com/applive/jswspro.m3u8' },
+    },
+    {
+      title: '江苏卫视4K超高清', extraId: '676', thumbnailsJson: ['https://images.jstv.com/jsws4k.png'],
+      extraJson: { url: 'https://litchi-play-encrypted.jstv.com/4klive/jsws4kpro.m3u8' },
+    },
+  ]
+  const calls = []
+  const fetchImpl = async (url, options) => {
+    calls.push({ url: String(url), options })
+    if (String(url).includes('/JwtAuth/GetWebToken')) {
+      return fakeResponse({ code: 200, data: { accessToken: token } })
+    }
+    return fakeResponse({ code: 200, data: { articles } })
+  }
+  const module = getModule('jstv')
+  const result = await module.fetch({ cachingMs: 0 }, { fetchImpl })
+  assert.deepEqual(result.groups[0].dataList.map(x => x.name), ['江苏卫视', '江苏卫视4K'])
+  assert.ok(result.groups[0].dataList.every(x => x.opts?.[0] === 'network-caching=3000'), '旧配置不影响固定缓冲')
+  assert.equal(calls.length, 2)
+  assert.match(calls[1].options.headers.Authorization, /^Bearer /)
+
+  const resolved = await resolveJstvChannel('jstv-670', {
+    now: 1720000000000,
+    fetchImpl: async () => { throw new Error('已有频道缓存时不该联网') },
+  })
+  assert.match(resolved.url, /txSecret=/)
+  assert.equal(resolved.upstreamHeaders.Origin, 'https://live.jstv.com')
+  assert.equal(resolved.upstreamHeaders.Referer, 'https://live.jstv.com/')
+})
+
+// ---- 河北广播电视台「冀时」 ----
+
+const hebtvArticle = ({ id, title, path, key = 'k5m9p2x8r4b3' }) => ({
+  id,
+  title,
+  logo: 'http://pic.cmc.hebrts.cn/logo.png',
+  appCustomParams: { movie: { liveUri: path, liveKey: key } },
+  liveVideo: [{ type: 'PC', formats: [{ url: `https://tv.pull.hebtv.com${path}` }] }],
+})
+
+const hebtvScenicArticle = ({ id, title, active = true }) => ({
+  id,
+  title,
+  type: '15',
+  appCustomParams: JSON.stringify({
+    movie: { liveStatus: active ? 1 : 0 },
+    customStyle: { imgPath: ['http://pic.cmc.hebrts.cn/scenic.jpg'] },
+  }),
+})
+
+check('河北：官网直播稿件规范成六套频道，固定排除三佳购物与未知稿件', () => {
+  const rows = normalizeHebtvRows([
+    hebtvArticle({ id: 10524916, title: '河北卫视', path: '/jishi/weishipindao.m3u8' }),
+    hebtvArticle({ id: 10516507, title: '经济生活', path: '/jishi/jingjishenghuo.m3u8' }),
+    hebtvArticle({ id: 10516509, title: '河北都市', path: '/jishi/dushipindao.m3u8' }),
+    hebtvArticle({ id: 10516510, title: '文旅体育', path: '/zhibo/yingshijupindao.m3u8' }),
+    hebtvArticle({ id: 10516511, title: '少儿科教', path: '/jishi/shaoerkejiao.m3u8' }),
+    hebtvArticle({ id: 10516508, title: '三农频道', path: '/jishi/nongminpindao.m3u8' }),
+    hebtvArticle({ id: 10516513, title: '三佳购物', path: '/zhibo/sanjiagouwu.m3u8' }),
+    hebtvArticle({ id: 1, title: '内部测试', path: '/jishi/test.m3u8' }),
+  ])
+  assert.deepEqual(rows.map(row => row.name), [
+    '河北卫视', '河北经济生活', '河北都市', '河北文旅体育', '河北少儿科教', '河北三农',
+  ])
+  const channels = buildHebtvChannels(rows)
+  assert.equal(channels.length, 6)
+  assert.equal(channels[0].deferredRef, 'hebtv-10524916')
+  assert.ok(channels.every(channel => channel.relayHls === true))
+  assert.ok(channels.every(channel => channel.catchup === 'none'), '纯直播：逐条关掉订阅头的回看声明')
+  assert.equal(channels[0].logo, 'https://pic.cmc.hebrts.cn/logo.png')
+})
+
+check('河北：美丽河北只收城市慢直播稿件，详情严格校验官方 CDN 与签名字段', () => {
+  const articles = normalizeHebtvScenicArticles([
+    hebtvScenicArticle({ id: 11605050, title: '慢直播丨石家庄' }),
+    hebtvScenicArticle({ id: 11605048, title: '慢直播｜雄安新区' }),
+    hebtvScenicArticle({ id: 11417638, title: '慢直播丨秘境精灵' }),
+    hebtvScenicArticle({ id: 1, title: '慢直播丨承德', active: false }),
+  ])
+  assert.deepEqual(articles.map(row => row.name), ['石家庄', '雄安新区'])
+  assert.equal(articles[0].logo, 'https://pic.cmc.hebrts.cn/scenic.jpg')
+
+  const detail = normalizeHebtvScenicDetail({ data: {
+    articleId: 11605050,
+    title: '慢直播丨石家庄',
+    status: '1',
+    livePath: 'https://live.pull.hebtv.com/live/mzb173.m3u8',
+    cdnUri: '/live/mzb173.m3u8',
+    cdnKey: 'k5m9p2x8r4b3',
+  } }, articles[0])
+  assert.equal(detail.name, '石家庄')
+  assert.equal(detail.scenic, true)
+  assert.equal(normalizeHebtvScenicDetail({ data: {
+    articleId: 11605050,
+    title: '慢直播丨石家庄',
+    status: '1',
+    livePath: 'https://evil.example/live/mzb173.m3u8',
+    cdnUri: '/live/mzb173.m3u8',
+    cdnKey: 'k5m9p2x8r4b3',
+  } }, articles[0]), null)
+})
+
+check('河北：两小时 t/k 签名与官网播放器固定样本逐字节一致', () => {
+  const signed = new URL(signHebtvStreamUrl(
+    'https://tv.pull.hebtv.com/jishi/weishipindao.m3u8',
+    '/jishi/weishipindao.m3u8',
+    'k5m9p2x8r4b3',
+    1720000000000,
+  ))
+  assert.equal(signed.searchParams.get('t'), '1720007200')
+  assert.equal(signed.searchParams.get('k'), '00496e7b70332f38d30084b44155b50d')
+  const scenic = new URL(signHebtvStreamUrl(
+    'https://live.pull.hebtv.com/live/mzb173.m3u8',
+    '/live/mzb173.m3u8',
+    'k5m9p2x8r4b3',
+    1720000000000,
+  ))
+  assert.equal(scenic.searchParams.get('t'), '1720007200')
+  assert.equal(scenic.searchParams.get('k'), '6f67777fbd80dba9e24ed067cfe74275')
+  assert.throws(() => signHebtvStreamUrl(
+    'https://example.com/jishi/weishipindao.m3u8',
+    '/jishi/weishipindao.m3u8',
+    'k5m9p2x8r4b3',
+    1720000000000,
+  ), /不是河北广电/)
+})
+
+await checkAsync('河北：电视与景观两个模块各抓各的，按真实流去重并在播放时复用缓存现签', async () => {
+  clearHebtvCache()
+  let calls = 0
+  const articles = [
+    hebtvArticle({ id: 10524916, title: '河北卫视', path: '/jishi/weishipindao.m3u8' }),
+    hebtvArticle({ id: 10516513, title: '三佳购物', path: '/zhibo/sanjiagouwu.m3u8' }),
+  ]
+  const scenicArticles = [
+    hebtvScenicArticle({ id: 11605050, title: '慢直播丨石家庄' }),
+    hebtvScenicArticle({ id: 12348364, title: '慢直播丨平山' }),
+  ]
+  const fetchImpl = async (rawUrl, options) => {
+    calls++
+    const url = String(rawUrl)
+    if (url.includes('getArticleList')) {
+      assert.equal(options.method, 'POST')
+      return fakeResponse({ returnCode: '0000', returnDesc: '成功', returnData: { news: articles } })
+    }
+    assert.equal(options.method, 'GET')
+    if (url.includes('findPage')) {
+      return fakeResponse({ data: { pageRecords: scenicArticles } })
+    }
+    const id = new URL(url).searchParams.get('articleId')
+    const article = scenicArticles.find(row => String(row.id) === id)
+    return fakeResponse({ state: 200, data: {
+      articleId: article.id,
+      title: article.title,
+      status: '1',
+      livePath: 'https://live.pull.hebtv.com/live/mzb173.m3u8',
+      cdnUri: '/live/mzb173.m3u8',
+      cdnKey: 'k5m9p2x8r4b3',
+    } })
+  }
+  const module = getModule('hebtv')
+  const result = await module.fetch({}, { fetchImpl, now: 1720000000000 })
+  assert.deepEqual(result.groups.map(group => group.name), ['河北电视台'])
+  assert.deepEqual(result.groups[0].dataList.map(channel => channel.name), ['河北卫视'])
+  assert.ok(result.groups[0].dataList.every(channel => channel.opts?.[0] === 'network-caching=3000'))
+  assert.equal(calls, 1, '电视模块只取电视栏目')
+  const scenicModule = getModule('hebtv-scenic')
+  const scenicResult = await scenicModule.fetch({}, { fetchImpl, now: 1720000000000 })
+  assert.deepEqual(scenicResult.groups.map(group => group.name), ['河北景观'])
+  assert.deepEqual(scenicResult.groups[0].dataList.map(channel => channel.name), ['石家庄'])
+  assert.ok(scenicResult.groups[0].dataList.every(channel => channel.opts?.[0] === 'network-caching=3000'))
+  assert.match(scenicResult.meta.warnings[0], /平山.*共用直播流/)
+
+  const resolved = await resolveHebtvChannel('hebtv-10524916', {
+    now: 1720000001000,
+    fetchImpl: async () => { throw new Error('已有频道缓存时不该联网') },
+  })
+  assert.equal(calls, 4)
+  assert.match(resolved.url, /^https:\/\/tv\.pull\.hebtv\.com\/jishi\/weishipindao\.m3u8\?t=1720007201&k=/)
+  assert.equal(resolved.relayHls, true)
+  assert.equal(resolved.upstreamHeaders.Origin, 'https://www.hebrts.cn')
+
+  const scenicResolved = await resolveHebtvChannel('hebtv-11605050', {
+    now: 1720000001000,
+    fetchImpl: async () => { throw new Error('景观也必须复用同一份缓存') },
+  })
+  assert.match(scenicResolved.url, /^https:\/\/live\.pull\.hebtv\.com\/live\/mzb173\.m3u8\?t=1720007201&k=/)
+
+  const bad = await resolveHebtvChannel('hebtv-999', { now: 1720000001000 })
+  assert.equal(bad.url, '')
+  assert.match(bad.desc, /不在官网列表/)
+
+  // 关掉「河北景观」的人：电视频道冷启动播放只取电视栏目，不去拉景观栏目和详情
+  clearHebtvCache()
+  const tvOnly = []
+  const coldTv = await resolveHebtvChannel('hebtv-10524916', {
+    now: 1720000001000,
+    fetchImpl: async (rawUrl, options) => { tvOnly.push(String(rawUrl)); return fetchImpl(rawUrl, options) },
+  })
+  assert.match(coldTv.url, /weishipindao\.m3u8\?t=/)
+  assert.equal(tvOnly.length, 1)
+  assert.match(tvOnly[0], /getArticleList/)
+
+  // 电视栏目挂了不耽误景观：景观频道照样能解析
+  clearHebtvCache()
+  const scenicWhileTvDown = await resolveHebtvChannel('hebtv-11605050', {
+    now: 1720000001000,
+    fetchImpl: async (rawUrl, options) => {
+      if (String(rawUrl).includes('getArticleList')) throw new Error('电视栏目维护')
+      return fetchImpl(rawUrl, options)
+    },
+  })
+  assert.match(scenicWhileTvDown.url, /^https:\/\/live\.pull\.hebtv\.com\/live\/mzb173\.m3u8\?t=/)
+  clearHebtvCache()
+})
+
+// ---- 深圳广电「第一现场」 ----
+
+const sztvRows = () => [
+  {
+    id: 24725, name: '深圳卫视4K超高清', logo: 'https://www.sztv.com.cn/4k.jpg',
+    extend: { liveId: 'R77mK1v', liveRate: [500], backGroundImageV1: '' },
+  },
+  {
+    id: 7867, name: '深圳卫视', logo: 'https://www.sztv.com.cn/ws.jpg',
+    extend: { liveId: 'AxeFRth', liveRate: [500], backGroundImageV1: '' },
+  },
+  {
+    id: 7868, name: '都市频道', logo: '',
+    extend: { liveId: 'ZwxzUXr', liveRate: [500], backGroundImageV1: 'https://www.sztv.com.cn/ds.jpg' },
+  },
+  { id: 7880, name: '电视剧频道', extend: { liveId: '4azbkoY', liveRate: [500] } },
+  { id: 7881, name: '少儿频道', extend: { liveId: '1SIQj6s', liveRate: [500] } },
+  { id: 7869, name: '移动电视', extend: { liveId: 'wDF6KJ3', liveRate: [500] } },
+  { id: 7878, name: '宜和购物频道', extend: { liveId: 'BJ5u5k2', liveRate: [500] } },
+  { id: 7944, name: '国际频道', extend: { liveId: 'sztvgjpd', liveRate: [500] } },
+]
+
+check('深圳：匿名 Web HMAC 固定样本与官网 yszsdk 一致', () => {
+  const now = 1720000000000
+  const nonce = '01234567-89ab-4cde-8123-456789abcdef'
+  const auth = buildSztvCatalogAuth(undefined, now, nonce)
+  const date = new Date(now).toUTCString()
+  const canonical = `x-date: ${date}\n@request-target: get /api/com/catalog/getCatalogList\nhost: apix.scms.sztv.com.cn\nnonce: ${nonce}`
+  const secret = Buffer.from('eFVKN0dsczQ1U3QwQ1RuYXRud1p3c0g0VXlZajBycFg=', 'base64').toString('utf8')
+  const expected = createHmac('sha512', secret).update(canonical).digest('base64')
+  assert.equal(auth['X-Date'], date)
+  assert.equal(auth.Nonce, nonce)
+  assert.match(auth.Authorization, /^hmac username="onesz"/)
+  assert.ok(auth.Authorization.endsWith(`signature="${expected}"`))
+})
+
+check('深圳：直播 Key 请求、混淆解码及 CDN 逐路径签名与固定样本一致', () => {
+  const now = 1720000000000
+  const keyRequest = new URL(buildSztvLiveKeyRequest('R77mK1v', now))
+  assert.equal(keyRequest.searchParams.get('t'), '1720000000')
+  assert.equal(
+    keyRequest.searchParams.get('token'),
+    createHash('md5').update('1720000000R77mK1vcutvLiveStream|Dream2017').digest('hex'),
+  )
+  assert.equal(decodeSztvLiveKey('"nUzgzN==AM3M"'), '783Rs70')
+  const signed = new URL(signSztvStreamUrl(
+    'https://sztv-live.sztv.com.cn/R77mK1v/500/783Rs70.m3u8',
+    now,
+  ))
+  assert.equal(signed.searchParams.get('t'), '66853a20')
+  assert.equal(
+    signed.searchParams.get('sign'),
+    createHash('md5').update(`ejow6p6p6hmrm9g96beh2knecdq5kyw9bp0zxyg7${signed.pathname}66853a20`).digest('hex'),
+  )
+  assert.throws(() => signSztvStreamUrl('https://example.com/steal.ts', now), /不是深圳广电/)
+})
+
+check('深圳：固定排除购物，七套频道规范命名并全部走全代理', () => {
+  const rows = sztvRows().filter(row => row.name !== '宜和购物频道').map(row => ({
+    id: String(row.id),
+    name: ({
+      深圳卫视4K超高清: '深圳卫视4K', 深圳卫视: '深圳卫视', 都市频道: '深圳都市',
+      电视剧频道: '深圳电视剧', 少儿频道: '深圳少儿', 移动电视: '深圳移动电视', 国际频道: '深圳国际',
+    })[row.name],
+    liveId: row.extend.liveId,
+    rate: row.extend.liveRate[0],
+    logo: row.logo || row.extend.backGroundImageV1 || '',
+  }))
+  const channels = buildSztvChannels(rows)
+  assert.deepEqual(channels.map(channel => channel.name), [
+    '深圳卫视4K', '深圳卫视', '深圳都市', '深圳电视剧', '深圳少儿', '深圳移动电视', '深圳国际',
+  ])
+  assert.ok(channels.every(channel => channel.catchup === 'none'), '纯直播：逐条关掉订阅头的回看声明')
+  assert.deepEqual(channels.map(channel => channel.deferredRef), [
+    'sztv-24725', 'sztv-7867', 'sztv-7868', 'sztv-7880', 'sztv-7881', 'sztv-7869', 'sztv-7944',
+  ])
+  assert.ok(channels.every(channel => channel.proxyHls === true))
+})
+
+await checkAsync('深圳：模块取七套官网频道，播放时换 Key 并提供分片动态签名器', async () => {
+  clearSztvCache()
+  let catalogCalls = 0
+  let keyCalls = 0
+  const calls = []
+  const fetchImpl = async (requestUrl, options = {}) => {
+    const url = new URL(String(requestUrl))
+    if (url.hostname === 'apix.scms.sztv.com.cn') {
+      catalogCalls++
+      assert.match(options.headers.Authorization, /^hmac username="onesz"/)
+      assert.match(options.headers.Nonce, /^[0-9a-f-]{36}$/)
+      return fakeResponse({ returnCode: '0000', returnDesc: '成功', returnData: sztvRows() })
+    }
+    if (url.href === 'https://sztv-live.sztv.com.cn/favicon.ico') {
+      calls.push('report')
+      assert.equal(options.headers.Origin, 'https://www.sztv.com.cn')
+      return fakeResponse('')
+    }
+    calls.push('key')
+    keyCalls++
+    assert.equal(url.hostname, 'hls-api.sztv.com.cn')
+    assert.equal(url.searchParams.get('id'), 'R77mK1v')
+    assert.equal(options.headers.Origin, 'https://www.sztv.com.cn')
+    return fakeResponse('"nUzgzN==AM3M"')
+  }
+
+  const module = getModule('sztv')
+  const result = await module.fetch({}, { fetchImpl })
+  assert.equal(result.groups[0].name, '广东')
+  assert.deepEqual(result.groups[0].dataList.map(channel => channel.name), [
+    '深圳卫视4K', '深圳卫视', '深圳都市', '深圳电视剧', '深圳少儿', '深圳移动电视', '深圳国际',
+  ])
+
+  const first = await resolveSztvChannel('sztv-24725', { fetchImpl, now: 1720000000000 })
+  const cached = await resolveSztvChannel('sztv-24725', { fetchImpl, now: 1720000001000 })
+  assert.match(first.url, /^https:\/\/sztv-live\.sztv\.com\.cn\/R77mK1v\/500\/783Rs70\.m3u8\?sign=/)
+  assert.equal(first.upstreamHeaders.Origin, 'https://www.sztv.com.cn')
+  assert.equal(first.proxyHls, true, '解析结果也必须强制代理，起播超时不能跳转 CDN 绕过缓存保护')
+  assert.equal(typeof first.upstreamUrlTransform, 'function')
+  assert.match(
+    first.upstreamUrlTransform('https://sztv-live.sztv.com.cn/R77mK1v/500/123/456.ts'),
+    /\/456\.ts\?sign=[0-9a-f]{32}&t=[0-9a-f]+$/,
+  )
+  assert.match(cached.url, /783Rs70\.m3u8/)
+  assert.equal(catalogCalls, 1)
+  assert.equal(keyCalls, 1)
+  // 照官网 getReport：冷起先报到再给地址，5 分钟内不重复报，播放中每满 5 分钟续报一次
+  assert.deepEqual(calls, ['key', 'report'])
+  await resolveSztvChannel('sztv-24725', { fetchImpl, now: 1720000000000 + 4 * 60 * 1000 })
+  assert.deepEqual(calls, ['key', 'report'])
+  await resolveSztvChannel('sztv-24725', { fetchImpl, now: 1720000000000 + 5 * 60 * 1000 })
+  await resolveSztvChannel('sztv-24725', { fetchImpl, now: 1720000000000 + 6 * 60 * 1000 })
+  assert.deepEqual(calls, ['key', 'report', 'report'])
+})
+
+await checkAsync('深圳：报到失败或超时不影响出地址', async () => {
+  clearSztvCache()
+  const fetchImpl = async (requestUrl) => {
+    const url = new URL(String(requestUrl))
+    if (url.hostname === 'apix.scms.sztv.com.cn') {
+      return fakeResponse({ returnCode: '0000', returnDesc: '成功', returnData: sztvRows() })
+    }
+    if (url.pathname === '/favicon.ico') throw new Error('connect ECONNRESET')
+    return fakeResponse('"nUzgzN==AM3M"')
+  }
+  const result = await resolveSztvChannel('sztv-24725', { fetchImpl, now: 1720000000000 })
+  assert.match(result.url, /^https:\/\/sztv-live\.sztv\.com\.cn\/R77mK1v\/500\/783Rs70\.m3u8\?sign=/)
+})
+
+// ---- 芒果 TV ----
+
+check('芒果：固定排除快乐购，官网分类重复频道只输出一次且全部走全代理', () => {
+  const rows = [
+    { id: '287', name: '金鹰卡通', channel_image: 'http://0img.hitv.com/jykt.jpg' },
+    { id: '267', name: '快乐购', channel_image: '' },
+    { id: '280', name: '湖南经视', channel_image: 'https://2img.hitv.com/hnjs.jpg' },
+    { id: '287', name: '金鹰卡通', channel_image: 'https://2img.hitv.com/duplicate.jpg' },
+    { id: '999', name: '临时活动直播', channel_image: '' },
+    // 芒果给这三台的 channel_image 是空的
+    { id: '218', name: '快乐垂钓', channel_image: '' },
+    { id: '269', name: '长沙新闻综合', channel_image: '' },
+    { id: '254', name: '长沙政法', channel_image: 'http://0img.hitv.com/generic.jpg' },
+  ]
+  const channels = buildMgtvChannels(rows)
+  assert.deepEqual(channels.map(channel => channel.name), ['金鹰卡通', '湖南经视', '快乐垂钓', '长沙新闻综合', '长沙政法'])
+  assert.equal(channels[0].deferredRef, 'mgtv-287')
+  assert.equal(channels[0].logo, 'https://0img.hitv.com/jykt.jpg')
+  assert.ok(channels.every(channel => channel.proxyHls === true))
+  assert.ok(channels.every(channel => channel.catchup === 'none'), '纯直播：逐条关掉订阅头的回看声明')
+  // 长沙两台用长沙广电官网的频道图标，芒果以后给了图也不顶替；快乐垂钓官方没有，留空
+  const logoOf = name => channels.find(channel => channel.name === name).logo
+  assert.equal(logoOf('快乐垂钓'), '')
+  assert.match(logoOf('长沙新闻综合'), /^https:\/\/cdn-fuse-oss\.csbtv\.com\/images\/[0-9a-f]{24}\.png$/)
+  assert.match(logoOf('长沙政法'), /^https:\/\/cdn-oss\.zhcs\.csbtv\.com\/zhcs-prd\/images\/\d+\.png$/)
+})
+
+check('芒果：播放签名与官网固定样本一致，且最高 definition 同档优先 H.264', () => {
+  const request = new URL(buildMgtvSourceRequest('287', {
+    now: 1787985107731,
+    deviceId: '494daf13-3a4d-4e45-a020-3d24c425b9d4',
+  }))
+  assert.equal(request.searchParams.get('sign'), 'AD8915099571D2CDE4CFCF5F6CA95715')
+  assert.equal(request.searchParams.get('_support'), '10000000')
+
+  const selected = selectMgtvSource({ sources: [
+    { definition: 1, name: '480P', format: '.m3u8', videoFormat: 'h264', url: 'https://padal.qing.mgtv.com/live/480.m3u8' },
+    { definition: 3, name: '1080P', format: '.m3u8', videoFormat: 'h265', url: 'https://padhw.qing.mgtv.com/live/1080-hevc.m3u8' },
+    { definition: 3, name: '1080P', format: '.m3u8', videoFormat: 'h264', url: 'https://padqq.qing.mgtv.com/live/1080-avc.m3u8' },
+  ] })
+  assert.match(selected.url, /1080-avc\.m3u8$/)
+})
+
+await checkAsync('芒果：模块取官方频道表，播放时签名并声明防盗链请求头', async () => {
+  clearMgtvCache()
+  const module = getModule('mgtv')
+  const listResult = await module.fetch({}, { fetchImpl: async url => {
+    assert.match(String(url), /media_asset_id=TVStationAll/)
+    return fakeResponse({ errno: '0', data: { category: [
+      { channels: [
+        { id: '287', name: '金鹰卡通', channel_image: 'http://0img.hitv.com/jykt.jpg' },
+        { id: '267', name: '快乐购', channel_image: '' },
+      ] },
+    ] } })
+  } })
+  assert.deepEqual(listResult.groups[0].dataList.map(channel => channel.name), ['金鹰卡通'])
+
+  let calls = 0
+  const resolved = await resolveMgtvChannel('mgtv-287', {
+    now: 1720000000000,
+    deviceId: '00000000-0000-4000-8000-000000000001',
+    fetchImpl: async url => {
+      calls++
+      assert.match(String(url), /cameraId=287/)
+      return fakeResponse({ code: 0, data: { activityName: '金鹰卡通', sources: [
+        { definition: 1, name: '480P', format: '.m3u8', videoFormat: 'h264', urlExpireDuration: 28800,
+          url: 'https://padal.qing.mgtv.com/live/480.m3u8' },
+        { definition: 3, name: '1080P', format: '.m3u8', videoFormat: 'h264', urlExpireDuration: 28800,
+          url: 'https://padqq.qing.mgtv.com/live/1080.m3u8' },
+      ] } })
+    },
+  })
+  assert.equal(calls, 1)
+  assert.match(resolved.url, /1080\.m3u8$/)
+  assert.equal(resolved.upstreamHeaders.Origin, 'https://www.mgtv.com')
+  assert.equal(resolved.upstreamHeaders.Referer, 'https://www.mgtv.com/')
+})
+
+await checkAsync('芒果：每小时提前换新，失败沿用未过期地址并一分钟后恢复', async () => {
+  clearMgtvCache()
+  const startedAt = 1720000000000
+  let calls = 0
+  const payload = suffix => fakeResponse({ code: 0, data: { activityName: '金鹰卡通', sources: [
+    { definition: 1, name: '480P', format: '.m3u8', videoFormat: 'h264', urlExpireDuration: 28800,
+      url: `https://padal.qing.mgtv.com/live/${suffix}.m3u8` },
+  ] } })
+  const first = await resolveMgtvChannel('mgtv-287', {
+    now: startedAt,
+    fetchImpl: async () => { calls++; return payload('old') },
+  })
+  assert.match(first.url, /old\.m3u8$/)
+
+  const stale = await resolveMgtvChannel('mgtv-287', {
+    now: startedAt + 60 * 60 * 1000 + 1,
+    fetchImpl: async () => { calls++; throw new Error('官网瞬时故障') },
+  })
+  assert.match(stale.url, /old\.m3u8$/)
+
+  const retrySuppressed = await resolveMgtvChannel('mgtv-287', {
+    now: startedAt + 60 * 60 * 1000 + 30 * 1000,
+    fetchImpl: async () => { calls++; throw new Error('一分钟内不应重试') },
+  })
+  assert.match(retrySuppressed.url, /old\.m3u8$/)
+  assert.equal(calls, 2)
+
+  const recovered = await resolveMgtvChannel('mgtv-287', {
+    now: startedAt + 61 * 60 * 1000 + 2,
+    fetchImpl: async () => { calls++; return payload('new') },
+  })
+  assert.match(recovered.url, /new\.m3u8$/)
+  assert.equal(calls, 3)
+})
+
+console.log(`\n全部通过：${passed} ✅`)
